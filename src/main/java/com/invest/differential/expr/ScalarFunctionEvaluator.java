@@ -1,20 +1,28 @@
 package com.invest.differential.expr;
 
+import com.invest.differential.udf.ScalarUdf;
+import com.invest.differential.udf.UdfRegistry;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
 import java.util.List;
 
 /**
- * Evaluates scalar functions: arithmetic, comparison, boolean, string operations.
+ * Evaluates scalar functions: arithmetic, comparison, boolean, string operations, and UDFs.
  */
 public final class ScalarFunctionEvaluator implements ExpressionEvaluator {
 
     private final String functionName;
     private final List<ExpressionEvaluator> arguments;
+    private final UdfRegistry udfRegistry;
 
     public ScalarFunctionEvaluator(String functionName, List<ExpressionEvaluator> arguments) {
+        this(functionName, arguments, null);
+    }
+
+    public ScalarFunctionEvaluator(String functionName, List<ExpressionEvaluator> arguments, UdfRegistry udfRegistry) {
         this.functionName = functionName;
         this.arguments = arguments;
+        this.udfRegistry = udfRegistry;
     }
 
     @Override
@@ -49,12 +57,26 @@ public final class ScalarFunctionEvaluator implements ExpressionEvaluator {
             // String
             case "concat" -> concat(root, rowIndex);
 
-            default -> throw new UnsupportedOperationException("Unknown function: " + functionName);
+            default -> evaluateUdf(root, rowIndex);
         };
     }
 
     public String functionName() { return functionName; }
     public List<ExpressionEvaluator> arguments() { return arguments; }
+
+    private Object evaluateUdf(VectorSchemaRoot root, int rowIndex) {
+        if (udfRegistry != null) {
+            UdfRegistry.UdfEntry entry = udfRegistry.get(functionName);
+            if (entry != null) {
+                Object[] args = new Object[arguments.size()];
+                for (int i = 0; i < arguments.size(); i++) {
+                    args[i] = arguments.get(i).evaluate(root, rowIndex);
+                }
+                return entry.implementation().evaluate(args);
+            }
+        }
+        throw new UnsupportedOperationException("Unknown function: " + functionName);
+    }
 
     @SuppressWarnings("unchecked")
     private Object arith(VectorSchemaRoot root, int rowIndex, char op) {

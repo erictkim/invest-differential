@@ -5,8 +5,11 @@ import com.invest.differential.operator.Circuit;
 import com.invest.differential.operator.InputOperator;
 import com.invest.differential.operator.OutputOperator;
 import com.invest.differential.plan.PlanCompiler;
+import com.invest.differential.udf.ScalarUdf;
+import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.ZSet;
 import io.substrait.isthmus.SqlToSubstrait;
+import io.substrait.isthmus.UdfSqlToSubstrait;
 import io.substrait.plan.Plan;
 import io.substrait.plan.ProtoPlanConverter;
 import org.apache.arrow.memory.BufferAllocator;
@@ -34,6 +37,7 @@ public final class IncrementalEngine implements AutoCloseable {
     private final BufferAllocator allocator;
     private final boolean ownsAllocator;
     private final Map<String, Schema> tableSchemas = new LinkedHashMap<>();
+    private final UdfRegistry udfRegistry = new UdfRegistry();
     private Circuit circuit;
     private boolean compiled;
 
@@ -68,6 +72,29 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Register a user-defined scalar function. Must be called before query compilation.
+     *
+     * @param name       function name (case-insensitive in SQL)
+     * @param impl       function implementation
+     * @param argTypes   Substrait type names for arguments ("string", "i32", "i64", "fp64", "boolean")
+     * @param returnType Substrait type name for the return value
+     */
+    public IncrementalEngine registerUdf(String name, ScalarUdf impl, String[] argTypes, String returnType) {
+        if (compiled) {
+            throw new IllegalStateException("Cannot register UDFs after compilation");
+        }
+        udfRegistry.register(name, impl, argTypes, returnType);
+        return this;
+    }
+
+    /**
+     * Get the UDF registry (for advanced usage).
+     */
+    public UdfRegistry getUdfRegistry() {
+        return udfRegistry;
+    }
+
+    /**
      * Compile a SQL query into the incremental circuit.
      */
     public IncrementalEngine sql(String sqlQuery) {
@@ -78,9 +105,24 @@ public final class IncrementalEngine implements AutoCloseable {
                 createStatements.add(buildCreateTable(entry.getKey(), entry.getValue()));
             }
 
-            SqlToSubstrait converter = new SqlToSubstrait();
-            io.substrait.proto.Plan protoPlan = converter.execute(sqlQuery, createStatements);
-            ProtoPlanConverter planConverter = new ProtoPlanConverter();
+            io.substrait.proto.Plan protoPlan;
+            io.substrait.extension.SimpleExtension.ExtensionCollection extensions;
+            if (udfRegistry.isEmpty()) {
+                SqlToSubstrait converter = new SqlToSubstrait();
+                protoPlan = converter.execute(sqlQuery, createStatements);
+                extensions = null;
+            } else {
+                extensions = udfRegistry.buildMergedExtensions();
+                UdfSqlToSubstrait converter = new UdfSqlToSubstrait(
+                        udfRegistry.buildOperatorTable(),
+                        udfRegistry.buildSigs(),
+                        extensions);
+                protoPlan = converter.execute(sqlQuery, createStatements);
+            }
+
+            ProtoPlanConverter planConverter = extensions != null
+                    ? new ProtoPlanConverter(extensions)
+                    : new ProtoPlanConverter();
             Plan plan = planConverter.from(protoPlan);
             return plan(plan);
         } catch (Exception e) {
@@ -95,7 +137,7 @@ public final class IncrementalEngine implements AutoCloseable {
         if (compiled) {
             throw new IllegalStateException("Circuit already compiled");
         }
-        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas);
+        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas, udfRegistry);
         this.circuit = compiler.compile(plan);
         this.compiled = true;
         return this;
@@ -107,7 +149,9 @@ public final class IncrementalEngine implements AutoCloseable {
     public IncrementalEngine planFromBytes(byte[] protobufBytes) {
         try {
             io.substrait.proto.Plan protoPlan = io.substrait.proto.Plan.parseFrom(protobufBytes);
-            ProtoPlanConverter converter = new ProtoPlanConverter();
+            ProtoPlanConverter converter = udfRegistry.isEmpty()
+                    ? new ProtoPlanConverter()
+                    : new ProtoPlanConverter(udfRegistry.buildMergedExtensions());
             Plan plan = converter.from(protoPlan);
             return plan(plan);
         } catch (Exception e) {

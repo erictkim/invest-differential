@@ -3,6 +3,7 @@ package com.invest.differential.plan;
 import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.expr.*;
 import com.invest.differential.operator.*;
+import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.AggregateDescription;
 import com.invest.differential.zset.RowCombiner;
 import com.invest.differential.zset.RowMapper;
@@ -34,11 +35,17 @@ public final class PlanCompiler {
     private final BufferAllocator allocator;
     private final Map<String, Schema> tableSchemas;
     private final Circuit circuit;
+    private final UdfRegistry udfRegistry;
 
     public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas) {
+        this(allocator, tableSchemas, null);
+    }
+
+    public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas, UdfRegistry udfRegistry) {
         this.allocator = allocator;
         this.tableSchemas = tableSchemas;
         this.circuit = new Circuit();
+        this.udfRegistry = udfRegistry;
     }
 
     /**
@@ -894,6 +901,8 @@ public final class PlanCompiler {
             return new LiteralEvaluator(lit.value());
         } else if (expr instanceof Expression.StrLiteral lit) {
             return new LiteralEvaluator(lit.value());
+        } else if (expr instanceof Expression.VarCharLiteral lit) {
+            return new LiteralEvaluator(lit.value());
         } else if (expr instanceof Expression.NullLiteral) {
             return new LiteralEvaluator(null);
         } else if (expr instanceof Expression.ScalarFunctionInvocation func) {
@@ -924,7 +933,7 @@ public final class PlanCompiler {
                 args.add(compileExpression(argExpr, inputSchema));
             }
         }
-        return new ScalarFunctionEvaluator(name, args);
+        return new ScalarFunctionEvaluator(name, args, udfRegistry);
     }
 
     // ---- Helpers ----
