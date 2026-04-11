@@ -1,0 +1,241 @@
+package com.invest.differential;
+
+import com.invest.differential.operator.Circuit;
+import com.invest.differential.operator.InputOperator;
+import com.invest.differential.operator.OutputOperator;
+import com.invest.differential.plan.PlanCompiler;
+import com.invest.differential.zset.ZSet;
+import io.substrait.isthmus.SqlToSubstrait;
+import io.substrait.plan.Plan;
+import io.substrait.plan.ProtoPlanConverter;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.util.*;
+
+/**
+ * Public API for the incremental view maintenance engine.
+ *
+ * <p>Usage:
+ * <pre>{@code
+ * try (IncrementalEngine engine = IncrementalEngine.create()) {
+ *     engine.registerTable("orders", ordersSchema);
+ *     engine.sql("SELECT product, SUM(amount) FROM orders GROUP BY product");
+ *     engine.pushChanges("orders", deltaZSet);
+ *     engine.step();
+ *     ZSet result = engine.getOutput();
+ * }
+ * }</pre>
+ */
+public final class IncrementalEngine implements AutoCloseable {
+
+    private final BufferAllocator allocator;
+    private final boolean ownsAllocator;
+    private final Map<String, Schema> tableSchemas = new LinkedHashMap<>();
+    private Circuit circuit;
+    private boolean compiled;
+
+    private IncrementalEngine(BufferAllocator allocator, boolean ownsAllocator) {
+        this.allocator = allocator;
+        this.ownsAllocator = ownsAllocator;
+    }
+
+    /**
+     * Create an engine with its own RootAllocator.
+     */
+    public static IncrementalEngine create() {
+        return new IncrementalEngine(new RootAllocator(), true);
+    }
+
+    /**
+     * Create an engine using an existing allocator (caller manages lifecycle).
+     */
+    public static IncrementalEngine create(BufferAllocator allocator) {
+        return new IncrementalEngine(allocator, false);
+    }
+
+    /**
+     * Register a table schema. Must be called before query compilation.
+     */
+    public IncrementalEngine registerTable(String name, Schema schema) {
+        if (compiled) {
+            throw new IllegalStateException("Cannot register tables after compilation");
+        }
+        tableSchemas.put(name, schema);
+        return this;
+    }
+
+    /**
+     * Compile a SQL query into the incremental circuit.
+     */
+    public IncrementalEngine sql(String sqlQuery) {
+        try {
+            // Build CREATE TABLE statements for Calcite schema
+            List<String> createStatements = new ArrayList<>();
+            for (Map.Entry<String, Schema> entry : tableSchemas.entrySet()) {
+                createStatements.add(buildCreateTable(entry.getKey(), entry.getValue()));
+            }
+
+            SqlToSubstrait converter = new SqlToSubstrait();
+            io.substrait.proto.Plan protoPlan = converter.execute(sqlQuery, createStatements);
+            ProtoPlanConverter planConverter = new ProtoPlanConverter();
+            Plan plan = planConverter.from(protoPlan);
+            return plan(plan);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to compile SQL: " + sqlQuery, e);
+        }
+    }
+
+    /**
+     * Compile a Substrait plan (POJO) into the incremental circuit.
+     */
+    public IncrementalEngine plan(Plan plan) {
+        if (compiled) {
+            throw new IllegalStateException("Circuit already compiled");
+        }
+        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas);
+        this.circuit = compiler.compile(plan);
+        this.compiled = true;
+        return this;
+    }
+
+    /**
+     * Compile a Substrait plan from protobuf bytes.
+     */
+    public IncrementalEngine planFromBytes(byte[] protobufBytes) {
+        try {
+            io.substrait.proto.Plan protoPlan = io.substrait.proto.Plan.parseFrom(protobufBytes);
+            ProtoPlanConverter converter = new ProtoPlanConverter();
+            Plan plan = converter.from(protoPlan);
+            return plan(plan);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse Substrait plan from bytes", e);
+        }
+    }
+
+    /**
+     * Push a delta (change set) for a table.
+     */
+    public IncrementalEngine pushChanges(String tableName, ZSet delta) {
+        ensureCompiled();
+        InputOperator input = circuit.getInput(tableName);
+        if (input == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        input.setValue(delta);
+        return this;
+    }
+
+    /**
+     * Execute one step of the incremental circuit.
+     * Processes all pending deltas through the operator graph.
+     */
+    public IncrementalEngine step() {
+        ensureCompiled();
+        circuit.step();
+        return this;
+    }
+
+    /**
+     * Get the output delta from the last step.
+     */
+    public ZSet getOutput() {
+        return getOutput(0);
+    }
+
+    /**
+     * Get the output delta from a specific output index.
+     */
+    public ZSet getOutput(int index) {
+        ensureCompiled();
+        List<OutputOperator> outputs = circuit.getOutputs();
+        if (index >= outputs.size()) {
+            throw new IndexOutOfBoundsException("Output index " + index + " out of range (size=" + outputs.size() + ")");
+        }
+        return outputs.get(index).getValue();
+    }
+
+    /**
+     * Reset all operator state.
+     */
+    public IncrementalEngine reset() {
+        if (circuit != null) {
+            circuit.reset();
+        }
+        return this;
+    }
+
+    /**
+     * Get the allocator used by this engine.
+     */
+    public BufferAllocator getAllocator() {
+        return allocator;
+    }
+
+    /**
+     * Get the compiled circuit (for advanced inspection).
+     */
+    public Circuit getCircuit() {
+        return circuit;
+    }
+
+    @Override
+    public void close() {
+        if (ownsAllocator) {
+            allocator.close();
+        }
+    }
+
+    private void ensureCompiled() {
+        if (!compiled) {
+            throw new IllegalStateException("No query compiled yet. Call sql() or plan() first.");
+        }
+    }
+
+    private String buildCreateTable(String name, Schema schema) {
+        StringBuilder sb = new StringBuilder("CREATE TABLE ");
+        sb.append(name).append(" (");
+        List<org.apache.arrow.vector.types.pojo.Field> fields = schema.getFields();
+        for (int i = 0; i < fields.size(); i++) {
+            if (i > 0) sb.append(", ");
+            org.apache.arrow.vector.types.pojo.Field field = fields.get(i);
+            sb.append("\"").append(field.getName()).append("\" ");
+            sb.append(arrowTypeToSql(field.getType()));
+            if (!field.isNullable()) {
+                sb.append(" NOT NULL");
+            }
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private String arrowTypeToSql(org.apache.arrow.vector.types.pojo.ArrowType type) {
+        if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Int intType) {
+            return switch (intType.getBitWidth()) {
+                case 8 -> "TINYINT";
+                case 16 -> "SMALLINT";
+                case 32 -> "INTEGER";
+                case 64 -> "BIGINT";
+                default -> "INTEGER";
+            };
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint fp) {
+            return switch (fp.getPrecision()) {
+                case SINGLE -> "REAL";
+                case DOUBLE -> "DOUBLE";
+                default -> "DOUBLE";
+            };
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8) {
+            return "VARCHAR";
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Bool) {
+            return "BOOLEAN";
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Decimal dec) {
+            return "DECIMAL(" + dec.getPrecision() + "," + dec.getScale() + ")";
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Date) {
+            return "DATE";
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Timestamp) {
+            return "TIMESTAMP";
+        }
+        return "VARCHAR";
+    }
+}
