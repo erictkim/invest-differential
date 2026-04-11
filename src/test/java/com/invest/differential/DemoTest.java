@@ -1275,4 +1275,217 @@ class DemoTest {
             }
         }
     }
+
+    // ---- Semi-Join / Anti-Join ----
+
+    @Test
+    void semiJoin_inSubquery_initialLoad() {
+        Schema ordersSchema = ordersJoinSchema();
+        Schema customersSchema = customersSchema();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("customers", customersSchema)
+                  .registerTable("orders", ordersSchema)
+                  .sql("SELECT o.order_id, o.cust_id, o.product, o.amount FROM orders o " +
+                       "WHERE o.cust_id IN (SELECT c.cust_id FROM customers c WHERE c.tier = 'Gold')");
+
+            engine.pushChanges("customers", ZSet.fromData(customersSchema, allocator, new Object[][]{
+                    {1, "Alice", "Gold"},
+                    {2, "Bob", "Silver"},
+                    {3, "Charlie", "Gold"},
+            }));
+            engine.pushChanges("orders", ZSet.fromData(ordersSchema, allocator, new Object[][]{
+                    {101, 1, "Laptop", 999},
+                    {102, 2, "Mouse", 25},
+                    {103, 3, "Monitor", 349},
+            }));
+            engine.step();
+
+            try (ZSet d = engine.getOutput()) {
+                d.compact();
+                Map<List<Object>, Integer> rows = toMap(d);
+                // Only orders for Gold customers (Alice=1, Charlie=3)
+                // Column order: cust_id, order_id, product, amount (join key first)
+                assertEquals(2, rows.size());
+                assertEquals(1, rows.get(List.of(1, 101, "Laptop", 999)));
+                assertEquals(1, rows.get(List.of(3, 103, "Monitor", 349)));
+            }
+        }
+    }
+
+    @Test
+    void semiJoin_customerBecomesGold() {
+        Schema ordersSchema = ordersJoinSchema();
+        Schema customersSchema = customersSchema();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("customers", customersSchema)
+                  .registerTable("orders", ordersSchema)
+                  .sql("SELECT o.order_id, o.cust_id, o.product, o.amount FROM orders o " +
+                       "WHERE o.cust_id IN (SELECT c.cust_id FROM customers c WHERE c.tier = 'Gold')");
+
+            // Initial: only Alice is Gold
+            engine.pushChanges("customers", ZSet.fromData(customersSchema, allocator, new Object[][]{
+                    {1, "Alice", "Gold"},
+                    {2, "Bob", "Silver"},
+            }));
+            engine.pushChanges("orders", ZSet.fromData(ordersSchema, allocator, new Object[][]{
+                    {101, 1, "Laptop", 999},
+                    {102, 2, "Mouse", 25},
+            }));
+            engine.step();
+
+            try (ZSet d1 = engine.getOutput()) {
+                d1.compact();
+                Map<List<Object>, Integer> rows = toMap(d1);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of(1, 101, "Laptop", 999)));
+            }
+
+            // Step 2: Bob upgrades to Gold
+            try (ZSet retract = ZSet.fromData(customersSchema, allocator, new Object[][]{{2, "Bob", "Silver"}})) {
+                engine.pushChanges("customers", retract.negate());
+            }
+            engine.pushChanges("customers", ZSet.fromData(customersSchema, allocator, new Object[][]{
+                    {2, "Bob", "Gold"},
+            }));
+            engine.step();
+
+            try (ZSet d2 = engine.getOutput()) {
+                d2.compact();
+                Map<List<Object>, Integer> rows = toMap(d2);
+                // Bob's order now appears
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of(2, 102, "Mouse", 25)));
+            }
+        }
+    }
+
+    @Test
+    void antiJoin_operator_initialLoad() {
+        // Test anti-join directly at the operator level since Isthmus can't generate
+        // ANTI join plans from NOT IN/NOT EXISTS SQL syntax
+        Schema leftSchema = new Schema(List.of(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.notNullable("name", new ArrowType.Utf8())
+        ));
+        Schema rightSchema = new Schema(List.of(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        // For ANTI join, output = left columns only
+        Schema outputSchema = leftSchema;
+
+        com.invest.differential.operator.Stream leftStream =
+                new com.invest.differential.operator.Stream(leftSchema);
+        com.invest.differential.operator.Stream rightStream =
+                new com.invest.differential.operator.Stream(rightSchema);
+
+        int leftCols = leftSchema.getFields().size();
+        com.invest.differential.zset.RowMapper leftMapper = (data, row) -> {
+            Object[] vals = new Object[leftCols];
+            for (int i = 0; i < leftCols; i++) {
+                vals[i] = com.invest.differential.arrow.ArrowUtils.getValue(data.getVector(i), row);
+            }
+            return vals;
+        };
+
+        com.invest.differential.operator.IncrementalJoinOperator joinOp =
+                new com.invest.differential.operator.IncrementalJoinOperator(
+                        leftStream, rightStream,
+                        new int[]{0}, new int[]{0},  // join on id
+                        outputSchema, null,  // no value combiner needed for ANTI
+                        com.invest.differential.operator.IncrementalJoinOperator.JoinType.ANTI,
+                        allocator, leftMapper, null);
+
+        // Push left: {(1, "Alice"), (2, "Bob"), (3, "Charlie")}
+        leftStream.setValue(ZSet.fromData(leftSchema, allocator, new Object[][]{
+                {1, "Alice"}, {2, "Bob"}, {3, "Charlie"}
+        }));
+        // Push right (excluded ids): {1, 3}
+        rightStream.setValue(ZSet.fromData(rightSchema, allocator, new Object[][]{
+                {1}, {3}
+        }));
+        joinOp.step();
+
+        try (ZSet result = joinOp.getOutput().getValue()) {
+            result.compact();
+            Map<List<Object>, Integer> rows = toMap(result);
+            // Only Bob (id=2) is not in right side
+            assertEquals(1, rows.size());
+            assertEquals(1, rows.get(List.of(2, "Bob")));
+        }
+
+        leftStream.clear();
+        rightStream.clear();
+        joinOp.close();
+    }
+
+    @Test
+    void antiJoin_operator_incrementalUpdate() {
+        Schema leftSchema = new Schema(List.of(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.notNullable("name", new ArrowType.Utf8())
+        ));
+        Schema rightSchema = new Schema(List.of(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        Schema outputSchema = leftSchema;
+
+        com.invest.differential.operator.Stream leftStream =
+                new com.invest.differential.operator.Stream(leftSchema);
+        com.invest.differential.operator.Stream rightStream =
+                new com.invest.differential.operator.Stream(rightSchema);
+
+        int leftCols = leftSchema.getFields().size();
+        com.invest.differential.zset.RowMapper leftMapper = (data, row) -> {
+            Object[] vals = new Object[leftCols];
+            for (int i = 0; i < leftCols; i++) {
+                vals[i] = com.invest.differential.arrow.ArrowUtils.getValue(data.getVector(i), row);
+            }
+            return vals;
+        };
+
+        com.invest.differential.operator.IncrementalJoinOperator joinOp =
+                new com.invest.differential.operator.IncrementalJoinOperator(
+                        leftStream, rightStream,
+                        new int[]{0}, new int[]{0},
+                        outputSchema, null,
+                        com.invest.differential.operator.IncrementalJoinOperator.JoinType.ANTI,
+                        allocator, leftMapper, null);
+
+        // Step 1: initial data
+        leftStream.setValue(ZSet.fromData(leftSchema, allocator, new Object[][]{
+                {1, "Alice"}, {2, "Bob"}
+        }));
+        rightStream.setValue(ZSet.fromData(rightSchema, allocator, new Object[][]{
+                {1}  // exclude Alice
+        }));
+        joinOp.step();
+
+        try (ZSet r1 = joinOp.getOutput().getValue()) {
+            r1.compact();
+            Map<List<Object>, Integer> rows = toMap(r1);
+            assertEquals(1, rows.size());
+            assertEquals(1, rows.get(List.of(2, "Bob")));
+        }
+
+        // Step 2: remove id=1 from right → Alice should now appear
+        try (ZSet retractRight = ZSet.fromData(rightSchema, allocator, new Object[][]{{1}})) {
+            rightStream.setValue(retractRight.negate());
+        }
+        leftStream.setValue(ZSet.empty(leftSchema, allocator));
+        joinOp.step();
+
+        try (ZSet r2 = joinOp.getOutput().getValue()) {
+            r2.compact();
+            Map<List<Object>, Integer> rows = toMap(r2);
+            // Alice appears (weight +1)
+            assertEquals(1, rows.size());
+            assertEquals(1, rows.get(List.of(1, "Alice")));
+        }
+
+        leftStream.clear();
+        rightStream.clear();
+        joinOp.close();
+    }
 }

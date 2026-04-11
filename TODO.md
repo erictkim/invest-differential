@@ -16,8 +16,8 @@ The engine only exposes deltas via `getOutput()`. Add a `getSnapshot()` or `mate
 ### 4. HAVING Clause Support
 No post-aggregate filtering exists. Supporting `HAVING` (filter on aggregate results) would be a natural extension of the aggregate operator.
 
-### 5. Subqueries and Semi/Anti-Joins
-`EXISTS`, `IN`, `NOT IN`, and correlated subqueries are common SQL patterns not yet handled in `PlanCompiler`.
+### 5. ~~Subqueries and Semi/Anti-Joins~~ ✅
+Semi-joins (`IN (subquery)`) and anti-joins are now supported via `IncrementalJoinOperator` with `SEMI`/`ANTI` join types. Enabled Calcite subquery expansion (`withExpand(true)`) for automatic decorrelation.
 
 ### 6. LIMIT/OFFSET (Fetch)
 Currently throws `UnsupportedOperationException`. While tricky for incremental semantics (requires maintained ordering), a top-K operator is feasible.

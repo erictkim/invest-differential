@@ -1,12 +1,17 @@
 package com.invest.differential.operator;
 
 import com.invest.differential.arrow.ArrowUtils;
+import com.invest.differential.arrow.RowHasher;
 import com.invest.differential.zset.IndexedZSet;
 import com.invest.differential.zset.RowCombiner;
 import com.invest.differential.zset.RowMapper;
 import com.invest.differential.zset.ZSet;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.util.*;
 
 /**
  * Incremental equi-join operator.
@@ -23,7 +28,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
  */
 public final class IncrementalJoinOperator implements Operator {
 
-    public enum JoinType { INNER, LEFT, RIGHT, FULL }
+    public enum JoinType { INNER, LEFT, RIGHT, FULL, SEMI, ANTI }
 
     private final Stream leftInput;
     private final Stream rightInput;
@@ -86,8 +91,7 @@ public final class IncrementalJoinOperator implements Operator {
             return vals;
         };
 
-        if (joinType == JoinType.RIGHT || joinType == JoinType.FULL
-                || joinType == JoinType.LEFT) {
+        if (joinType != JoinType.INNER) {
             this.previousOutput = ZSet.empty(outputDataSchema, allocator);
         } else {
             this.previousOutput = null;
@@ -102,7 +106,7 @@ public final class IncrementalJoinOperator implements Operator {
         if (joinType == JoinType.INNER) {
             stepInner(deltaLeft, deltaRight);
         } else {
-            stepOuter(deltaLeft, deltaRight);
+            stepIntegrateDiff(deltaLeft, deltaRight);
         }
     }
 
@@ -139,10 +143,10 @@ public final class IncrementalJoinOperator implements Operator {
     }
 
     /**
-     * Outer joins (LEFT, RIGHT, FULL): integrate-diff approach.
+     * Non-inner joins (LEFT, RIGHT, FULL, SEMI, ANTI): integrate-diff approach.
      * Accumulate state, recompute full join, diff with previous output.
      */
-    private void stepOuter(ZSet deltaLeft, ZSet deltaRight) {
+    private void stepIntegrateDiff(ZSet deltaLeft, ZSet deltaRight) {
         // Update states
         ZSet newLeftState = leftState.add(deltaLeft);
         newLeftState.compact();
@@ -155,7 +159,7 @@ public final class IncrementalJoinOperator implements Operator {
         rightState = newRightState;
 
         // Compute full join on current state
-        ZSet fullOutput = outerJoinZSets(leftState, rightState);
+        ZSet fullOutput = computeFullJoin(leftState, rightState);
         fullOutput.compact();
 
         // Diff: ΔOutput = fullOutput - previousOutput
@@ -183,43 +187,120 @@ public final class IncrementalJoinOperator implements Operator {
         return result;
     }
 
-    private ZSet outerJoinZSets(ZSet left, ZSet right) {
+    private ZSet computeFullJoin(ZSet left, ZSet right) {
         if (left.isEmpty() && right.isEmpty()) {
             return ZSet.empty(outputDataSchema, allocator);
         }
-        // Handle empty sides for outer joins
-        if (left.isEmpty() && joinType == JoinType.LEFT) {
+        if (left.isEmpty() && (joinType == JoinType.LEFT || joinType == JoinType.SEMI || joinType == JoinType.ANTI)) {
             return ZSet.empty(outputDataSchema, allocator);
         }
         if (right.isEmpty() && joinType == JoinType.RIGHT) {
             return ZSet.empty(outputDataSchema, allocator);
         }
+        // Anti-join with empty right: all left rows pass
+        if (right.isEmpty() && joinType == JoinType.ANTI) {
+            return left.map(outputDataSchema, unmatchedLeftMapper);
+        }
+        // Semi-join with empty right: no rows pass
+        if (right.isEmpty() && joinType == JoinType.SEMI) {
+            return ZSet.empty(outputDataSchema, allocator);
+        }
+
+        // SEMI/ANTI use direct key matching without IndexedZSet
+        if (joinType == JoinType.SEMI) {
+            return filterByKeyMatch(left, right, true);
+        }
+        if (joinType == JoinType.ANTI) {
+            return filterByKeyMatch(left, right, false);
+        }
 
         IndexedZSet leftIdx = left.index(leftKeyColumns);
         IndexedZSet rightIdx = right.index(rightKeyColumns);
 
-        IndexedZSet joined;
+        ZSet result;
         switch (joinType) {
-            case LEFT:
-                joined = leftIdx.leftJoin(rightIdx, outputDataSchema, valueCombiner, unmatchedLeftMapper);
+            case LEFT: {
+                IndexedZSet joined = leftIdx.leftJoin(rightIdx, outputDataSchema, valueCombiner, unmatchedLeftMapper);
+                result = joined.deindex();
+                joined.close();
                 break;
-            case RIGHT:
-                joined = leftIdx.rightJoin(rightIdx, outputDataSchema, valueCombiner, unmatchedRightMapper);
+            }
+            case RIGHT: {
+                IndexedZSet joined = leftIdx.rightJoin(rightIdx, outputDataSchema, valueCombiner, unmatchedRightMapper);
+                result = joined.deindex();
+                joined.close();
                 break;
-            case FULL:
-                joined = leftIdx.fullJoin(rightIdx, outputDataSchema, valueCombiner,
+            }
+            case FULL: {
+                IndexedZSet joined = leftIdx.fullJoin(rightIdx, outputDataSchema, valueCombiner,
                         unmatchedLeftMapper, unmatchedRightMapper);
+                result = joined.deindex();
+                joined.close();
                 break;
-            default:
-                joined = leftIdx.join(rightIdx, outputDataSchema, valueCombiner);
+            }
+            default: {
+                IndexedZSet joined = leftIdx.join(rightIdx, outputDataSchema, valueCombiner);
+                result = joined.deindex();
+                joined.close();
                 break;
+            }
         }
 
-        ZSet result = joined.deindex();
         leftIdx.close();
         rightIdx.close();
-        joined.close();
         return result;
+    }
+
+    /**
+     * Filter left rows by whether their keys match any right row.
+     * @param keepMatched true for semi-join (keep matched), false for anti-join (keep unmatched)
+     */
+    private ZSet filterByKeyMatch(ZSet left, ZSet right, boolean keepMatched) {
+        VectorSchemaRoot rightData = right.data();
+        Map<Integer, List<Integer>> rightByHash = new HashMap<>();
+        for (int row = 0; row < rightData.getRowCount(); row++) {
+            int h = RowHasher.hashRow(rightData, row, rightKeyColumns);
+            rightByHash.computeIfAbsent(h, k -> new ArrayList<>()).add(row);
+        }
+
+        VectorSchemaRoot leftData = left.data();
+        Schema outFullSchema = ArrowUtils.createSchemaWithWeight(outputDataSchema);
+        VectorSchemaRoot result = VectorSchemaRoot.create(outFullSchema, allocator);
+        result.allocateNew();
+
+        int leftWeightCol = leftData.getFieldVectors().size() - 1;
+        int outWeightCol = result.getFieldVectors().size() - 1;
+        int outRow = 0;
+
+        for (int leftRow = 0; leftRow < leftData.getRowCount(); leftRow++) {
+            int leftHash = RowHasher.hashRow(leftData, leftRow, leftKeyColumns);
+            boolean matched = false;
+
+            List<Integer> candidates = rightByHash.get(leftHash);
+            if (candidates != null) {
+                for (int rightRow : candidates) {
+                    boolean keysEqual = true;
+                    for (int k = 0; k < leftKeyColumns.length; k++) {
+                        Object lv = ArrowUtils.getValue(leftData.getVector(leftKeyColumns[k]), leftRow);
+                        Object rv = ArrowUtils.getValue(rightData.getVector(rightKeyColumns[k]), rightRow);
+                        if (!Objects.equals(lv, rv)) { keysEqual = false; break; }
+                    }
+                    if (keysEqual) { matched = true; break; }
+                }
+            }
+
+            if (matched == keepMatched) {
+                Object[] vals = unmatchedLeftMapper.map(leftData, leftRow);
+                for (int i = 0; i < vals.length; i++) {
+                    ArrowUtils.setValue(result.getVector(i), outRow, vals[i]);
+                }
+                int weight = ((IntVector) leftData.getVector(leftWeightCol)).get(leftRow);
+                ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, weight);
+                outRow++;
+            }
+        }
+        result.setRowCount(outRow);
+        return ZSet.fromRoot(outputDataSchema, result, allocator);
     }
 
     @Override

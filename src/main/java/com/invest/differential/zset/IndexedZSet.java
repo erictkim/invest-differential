@@ -501,6 +501,82 @@ public final class IndexedZSet implements AutoCloseable {
                 outFull, result, outHashes);
     }
 
+    /**
+     * Semi-join: return left rows that have at least one matching key on the right.
+     * Output schema matches the left side. Each matching left row keeps its original weight.
+     */
+    public IndexedZSet semiJoin(IndexedZSet other) {
+        Map<Integer, List<Integer>> leftGroups = buildKeyGroups();
+        Map<Integer, List<Integer>> rightGroups = other.buildKeyGroups();
+
+        VectorSchemaRoot result = VectorSchemaRoot.create(fullSchema, allocator);
+        result.allocateNew();
+        int thisWeightCol = this.data.getFieldVectors().size() - 1;
+        int outRow = 0;
+
+        for (Map.Entry<Integer, List<Integer>> leftEntry : leftGroups.entrySet()) {
+            List<Integer> rightRows = rightGroups.get(leftEntry.getKey());
+            if (rightRows == null) continue;
+
+            for (int leftRow : leftEntry.getValue()) {
+                boolean matched = false;
+                for (int rightRow : rightRows) {
+                    if (RowHasher.rowsEqual(this.data, leftRow, other.data, rightRow, keyColumnIndices)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) {
+                    ArrowUtils.copyRow(this.data, leftRow, result, outRow);
+                    outRow++;
+                }
+            }
+        }
+        result.setRowCount(outRow);
+
+        int[] outHashes = computeKeyHashes(result, keyColumnIndices);
+        return new IndexedZSet(allocator, keySchema, valueSchema, keyColumnIndices, valueColumnIndices,
+                fullSchema, result, outHashes);
+    }
+
+    /**
+     * Anti-join: return left rows that have NO matching key on the right.
+     * Output schema matches the left side. Each unmatched left row keeps its original weight.
+     */
+    public IndexedZSet antiJoin(IndexedZSet other) {
+        Map<Integer, List<Integer>> leftGroups = buildKeyGroups();
+        Map<Integer, List<Integer>> rightGroups = other.buildKeyGroups();
+
+        VectorSchemaRoot result = VectorSchemaRoot.create(fullSchema, allocator);
+        result.allocateNew();
+        int outRow = 0;
+
+        for (Map.Entry<Integer, List<Integer>> leftEntry : leftGroups.entrySet()) {
+            List<Integer> rightRows = rightGroups.get(leftEntry.getKey());
+
+            for (int leftRow : leftEntry.getValue()) {
+                boolean matched = false;
+                if (rightRows != null) {
+                    for (int rightRow : rightRows) {
+                        if (RowHasher.rowsEqual(this.data, leftRow, other.data, rightRow, keyColumnIndices)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if (!matched) {
+                    ArrowUtils.copyRow(this.data, leftRow, result, outRow);
+                    outRow++;
+                }
+            }
+        }
+        result.setRowCount(outRow);
+
+        int[] outHashes = computeKeyHashes(result, keyColumnIndices);
+        return new IndexedZSet(allocator, keySchema, valueSchema, keyColumnIndices, valueColumnIndices,
+                fullSchema, result, outHashes);
+    }
+
     // ---- Aggregate ----
 
     /**

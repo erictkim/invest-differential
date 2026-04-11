@@ -95,7 +95,7 @@ public class UdfSqlToSubstrait extends SqlConverterBase {
 
         SqlToRelConverter converter = new SqlToRelConverter(
                 null, queryValidator, freshReader, relOptCluster,
-                StandardConvertletTable.INSTANCE, converterConfig);
+                StandardConvertletTable.INSTANCE, converterConfig.withExpand(true));
 
         // Step 5: Build the Substrait protobuf Plan
         var plan = Plan.newBuilder();

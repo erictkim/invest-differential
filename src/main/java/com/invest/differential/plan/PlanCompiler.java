@@ -678,8 +678,26 @@ public final class PlanCompiler {
             case LEFT -> IncrementalJoinOperator.JoinType.LEFT;
             case RIGHT -> IncrementalJoinOperator.JoinType.RIGHT;
             case OUTER -> IncrementalJoinOperator.JoinType.FULL;
+            case SEMI -> IncrementalJoinOperator.JoinType.SEMI;
+            case ANTI -> IncrementalJoinOperator.JoinType.ANTI;
             default -> IncrementalJoinOperator.JoinType.INNER;
         };
+
+        // For SEMI/ANTI, output schema is left-side only
+        boolean isSemiAnti = (joinType == IncrementalJoinOperator.JoinType.SEMI
+                || joinType == IncrementalJoinOperator.JoinType.ANTI);
+        if (isSemiAnti) {
+            List<Field> semiAntiFields = new ArrayList<>(leftSchema.getFields());
+            if (remap != null) {
+                List<Field> remapped = new ArrayList<>();
+                for (int idx : emitIndices) {
+                    remapped.add(semiAntiFields.get(idx));
+                }
+                outputDataSchema = new Schema(remapped);
+            } else {
+                outputDataSchema = new Schema(semiAntiFields);
+            }
+        }
 
         // Adjust right key columns (they reference the combined left+right schema)
         int[] adjustedRightKeys = new int[rightKeyCols.length];
@@ -687,10 +705,28 @@ public final class PlanCompiler {
             adjustedRightKeys[i] = rightKeyCols[i] - leftColCount;
         }
 
-        // Build RowMappers for unmatched rows in outer joins
+        // Build RowMappers for unmatched rows in outer joins and SEMI/ANTI
         RowMapper unmatchedLeftMapper = null;
         RowMapper unmatchedRightMapper = null;
-        if (joinType != IncrementalJoinOperator.JoinType.INNER) {
+        if (isSemiAnti) {
+            // SEMI/ANTI: output = left columns only
+            int leftV = leftSchema.getFields().size();
+            final int[] semiEmit = emitIndices;
+            unmatchedLeftMapper = (data, row) -> {
+                Object[] vals = new Object[leftV];
+                for (int i = 0; i < leftV; i++) {
+                    vals[i] = ArrowUtils.getValue(data.getVector(i), row);
+                }
+                if (semiEmit != null) {
+                    Object[] emitted = new Object[semiEmit.length];
+                    for (int i = 0; i < semiEmit.length; i++) {
+                        emitted[i] = vals[semiEmit[i]];
+                    }
+                    return emitted;
+                }
+                return vals;
+            };
+        } else if (joinType != IncrementalJoinOperator.JoinType.INNER) {
             int leftV = leftSchema.getFields().size();
             int rightV = rightSchema.getFields().size();
             int totalRaw = leftV + rightV;

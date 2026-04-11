@@ -8,7 +8,6 @@ import com.invest.differential.plan.PlanCompiler;
 import com.invest.differential.udf.ScalarUdf;
 import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.ZSet;
-import io.substrait.isthmus.SqlToSubstrait;
 import io.substrait.isthmus.UdfSqlToSubstrait;
 import io.substrait.plan.Plan;
 import io.substrait.plan.ProtoPlanConverter;
@@ -107,22 +106,14 @@ public final class IncrementalEngine implements AutoCloseable {
 
             io.substrait.proto.Plan protoPlan;
             io.substrait.extension.SimpleExtension.ExtensionCollection extensions;
-            if (udfRegistry.isEmpty()) {
-                SqlToSubstrait converter = new SqlToSubstrait();
-                protoPlan = converter.execute(sqlQuery, createStatements);
-                extensions = null;
-            } else {
-                extensions = udfRegistry.buildMergedExtensions();
-                UdfSqlToSubstrait converter = new UdfSqlToSubstrait(
-                        udfRegistry.buildOperatorTable(),
-                        udfRegistry.buildSigs(),
-                        extensions);
-                protoPlan = converter.execute(sqlQuery, createStatements);
-            }
+            extensions = udfRegistry.buildMergedExtensions();
+            UdfSqlToSubstrait converter = new UdfSqlToSubstrait(
+                    udfRegistry.buildOperatorTable(),
+                    udfRegistry.buildSigs(),
+                    extensions);
+            protoPlan = converter.execute(sqlQuery, createStatements);
 
-            ProtoPlanConverter planConverter = extensions != null
-                    ? new ProtoPlanConverter(extensions)
-                    : new ProtoPlanConverter();
+            ProtoPlanConverter planConverter = new ProtoPlanConverter(extensions);
             Plan plan = planConverter.from(protoPlan);
             return plan(plan);
         } catch (Exception e) {
