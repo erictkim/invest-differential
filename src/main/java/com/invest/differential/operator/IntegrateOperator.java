@@ -1,5 +1,6 @@
 package com.invest.differential.operator;
 
+import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.zset.ZSet;
 import org.apache.arrow.memory.BufferAllocator;
 
@@ -31,14 +32,21 @@ public final class IntegrateOperator implements Operator {
         newState.compact();
         state.close();
         state = newState;
-        // Output is a reference to the current state (caller must not modify)
-        output.setValue(state);
+        // Clone state for output so the stream owns its own copy
+        output.setValue(ZSet.fromRoot(state.dataSchema(),
+                ArrowUtils.cloneRoot(state.data(), allocator), allocator));
     }
 
     @Override
     public void reset() {
         if (state != null) state.close();
         state = ZSet.empty(input.dataSchema(), allocator);
+        output.clear();
+    }
+
+    @Override
+    public void close() {
+        if (state != null) { state.close(); state = null; }
         output.clear();
     }
 

@@ -61,6 +61,13 @@ public final class IncrementalDistinctOperator implements Operator {
     }
 
     @Override
+    public void close() {
+        if (accumulatedInput != null) { accumulatedInput.close(); accumulatedInput = null; }
+        if (previousDistinct != null) { previousDistinct.close(); previousDistinct = null; }
+        output.clear();
+    }
+
+    @Override
     public Stream getOutput() { return output; }
 
     @Override

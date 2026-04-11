@@ -103,6 +103,13 @@ public final class IncrementalAggregateOperator<R, IR> implements Operator {
     }
 
     @Override
+    public void close() {
+        if (accumulatedInput != null) { accumulatedInput.close(); accumulatedInput = null; }
+        if (previousOutput != null) { previousOutput.close(); previousOutput = null; }
+        output.clear();
+    }
+
+    @Override
     public Stream getOutput() { return output; }
 
     @Override

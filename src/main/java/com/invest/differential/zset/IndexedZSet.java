@@ -23,10 +23,11 @@ public final class IndexedZSet implements AutoCloseable {
     private final int[] valueColumnIndices;
     private final Schema fullSchema;   // key + value + weight
     private VectorSchemaRoot data;
+    private int[] rowKeyHashes;         // cached per-row key hash
 
     private IndexedZSet(BufferAllocator allocator, Schema keySchema, Schema valueSchema,
                         int[] keyColumnIndices, int[] valueColumnIndices,
-                        Schema fullSchema, VectorSchemaRoot data) {
+                        Schema fullSchema, VectorSchemaRoot data, int[] rowKeyHashes) {
         this.allocator = allocator;
         this.keySchema = keySchema;
         this.valueSchema = valueSchema;
@@ -34,6 +35,7 @@ public final class IndexedZSet implements AutoCloseable {
         this.valueColumnIndices = valueColumnIndices;
         this.fullSchema = fullSchema;
         this.data = data;
+        this.rowKeyHashes = rowKeyHashes;
     }
 
     // ---- Factories ----
@@ -95,8 +97,9 @@ public final class IndexedZSet implements AutoCloseable {
         }
         result.setRowCount(rowCount);
 
+        int[] hashes = computeKeyHashes(result, newKeyIndices);
         return new IndexedZSet(allocator, keySchema, valueSchema, newKeyIndices, newValueIndices,
-                fullSchema, result);
+                fullSchema, result, hashes);
     }
 
     public static IndexedZSet empty(Schema keySchema, Schema valueSchema, BufferAllocator allocator) {
@@ -112,7 +115,7 @@ public final class IndexedZSet implements AutoCloseable {
         int[] valueIndices = new int[valueSchema.getFields().size()];
         for (int i = 0; i < valueIndices.length; i++) valueIndices[i] = keyIndices.length + i;
         VectorSchemaRoot root = ArrowUtils.createEmpty(fullSchema, allocator);
-        return new IndexedZSet(allocator, keySchema, valueSchema, keyIndices, valueIndices, fullSchema, root);
+        return new IndexedZSet(allocator, keySchema, valueSchema, keyIndices, valueIndices, fullSchema, root, new int[0]);
     }
 
     // ---- Accessors ----
@@ -147,8 +150,11 @@ public final class IndexedZSet implements AutoCloseable {
             ArrowUtils.copyRow(other.data, row, result, thisRows + row);
         }
         result.setRowCount(thisRows + otherRows);
+        int[] mergedHashes = new int[thisRows + otherRows];
+        System.arraycopy(this.rowKeyHashes, 0, mergedHashes, 0, thisRows);
+        System.arraycopy(other.rowKeyHashes, 0, mergedHashes, thisRows, otherRows);
         return new IndexedZSet(allocator, keySchema, valueSchema, keyColumnIndices, valueColumnIndices,
-                fullSchema, result);
+                fullSchema, result, mergedHashes);
     }
 
     public IndexedZSet negate() {
@@ -159,7 +165,7 @@ public final class IndexedZSet implements AutoCloseable {
             wv.setSafe(row, Math.negateExact(wv.get(row)));
         }
         return new IndexedZSet(allocator, keySchema, valueSchema, keyColumnIndices, valueColumnIndices,
-                fullSchema, result);
+                fullSchema, result, rowKeyHashes.clone());
     }
 
     // ---- Join ----
@@ -226,8 +232,9 @@ public final class IndexedZSet implements AutoCloseable {
         }
         result.setRowCount(outRow);
 
+        int[] outHashes = computeKeyHashes(result, outKeyIndices);
         return new IndexedZSet(allocator, keySchema, outputValueSchema, outKeyIndices, outValueIndices,
-                outFull, result);
+                outFull, result, outHashes);
     }
 
     /**
@@ -301,8 +308,9 @@ public final class IndexedZSet implements AutoCloseable {
         }
         result.setRowCount(outRow);
 
+        int[] outHashes = computeKeyHashes(result, outKeyIndices);
         return new IndexedZSet(allocator, keySchema, outputValueSchema, outKeyIndices, outValueIndices,
-                outFull, result);
+                outFull, result, outHashes);
     }
 
     // ---- Aggregate ----
@@ -369,8 +377,9 @@ public final class IndexedZSet implements AutoCloseable {
         }
         result.setRowCount(outRow);
 
+        int[] outHashes = computeKeyHashes(result, outKeyIndices);
         return new IndexedZSet(allocator, keySchema, resultValueSchema, outKeyIndices, outValueIndices,
-                outFull, result);
+                outFull, result, outHashes);
     }
 
     // ---- Flatten / Deindex ----
@@ -434,11 +443,19 @@ public final class IndexedZSet implements AutoCloseable {
 
     // ---- Internal ----
 
+    private static int[] computeKeyHashes(VectorSchemaRoot data, int[] keyColumnIndices) {
+        int rowCount = data.getRowCount();
+        int[] hashes = new int[rowCount];
+        for (int row = 0; row < rowCount; row++) {
+            hashes[row] = RowHasher.hashRow(data, row, keyColumnIndices);
+        }
+        return hashes;
+    }
+
     private Map<Integer, List<Integer>> buildKeyGroups() {
         Map<Integer, List<Integer>> groups = new HashMap<>();
         for (int row = 0; row < data.getRowCount(); row++) {
-            int hash = RowHasher.hashRow(data, row, keyColumnIndices);
-            groups.computeIfAbsent(hash, k -> new ArrayList<>(4)).add(row);
+            groups.computeIfAbsent(rowKeyHashes[row], k -> new ArrayList<>(4)).add(row);
         }
         return groups;
     }

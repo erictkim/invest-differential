@@ -1,5 +1,6 @@
 package com.invest.differential;
 
+import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.operator.Circuit;
 import com.invest.differential.operator.InputOperator;
 import com.invest.differential.operator.OutputOperator;
@@ -123,7 +124,10 @@ public final class IncrementalEngine implements AutoCloseable {
         if (input == null) {
             throw new IllegalArgumentException("Unknown table: " + tableName);
         }
-        input.setValue(delta);
+        // Clone the delta so the caller retains ownership of the original
+        ZSet cloned = ZSet.fromRoot(delta.dataSchema(),
+                ArrowUtils.cloneRoot(delta.data(), allocator), allocator);
+        input.setValue(cloned);
         return this;
     }
 
@@ -153,7 +157,12 @@ public final class IncrementalEngine implements AutoCloseable {
         if (index >= outputs.size()) {
             throw new IndexOutOfBoundsException("Output index " + index + " out of range (size=" + outputs.size() + ")");
         }
-        return outputs.get(index).getValue();
+        ZSet val = outputs.get(index).getValue();
+        if (val == null) {
+            return ZSet.empty(outputs.get(index).getOutput().dataSchema(), allocator);
+        }
+        return ZSet.fromRoot(val.dataSchema(),
+                ArrowUtils.cloneRoot(val.data(), allocator), allocator);
     }
 
     /**
@@ -182,6 +191,9 @@ public final class IncrementalEngine implements AutoCloseable {
 
     @Override
     public void close() {
+        if (circuit != null) {
+            circuit.close();
+        }
         if (ownsAllocator) {
             allocator.close();
         }

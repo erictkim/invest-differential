@@ -49,7 +49,7 @@ public final class PlanCompiler {
             Stream result = compileRel(rel);
 
             // Wrap with output operator
-            OutputOperator outputOp = new OutputOperator("output", result);
+            OutputOperator outputOp = new OutputOperator("output", result, allocator);
             circuit.addOperator(outputOp);
         }
         return circuit;
@@ -246,6 +246,20 @@ public final class PlanCompiler {
         String[] funcNames = new String[numMeasures];
         int[] inputCols = new int[numMeasures];
 
+        // Build mapping from original column index to value-column position in IndexedZSet.
+        // IndexedZSet.aggregate passes values[] containing only non-key columns in order.
+        java.util.Set<Integer> keySet = new java.util.HashSet<>();
+        for (int k : groupByColumns) keySet.add(k);
+        int totalInputCols = inputSchema.getFields().size();
+        int[] origToValueIdx = new int[totalInputCols];
+        java.util.Arrays.fill(origToValueIdx, -1);
+        int valPos = 0;
+        for (int c = 0; c < totalInputCols; c++) {
+            if (!keySet.contains(c)) {
+                origToValueIdx[c] = valPos++;
+            }
+        }
+
         for (int i = 0; i < numMeasures; i++) {
             AggregateFunctionInvocation func = measures.get(i).getFunction();
             String funcName = resolveAggregateFunctionName(func);
@@ -256,7 +270,8 @@ public final class PlanCompiler {
             } else {
                 io.substrait.expression.FunctionArg firstArg = func.arguments().get(0);
                 if (firstArg instanceof Expression argExpr && argExpr instanceof FieldReference ref) {
-                    inputCols[i] = resolveFieldIndex(ref);
+                    int origCol = resolveFieldIndex(ref);
+                    inputCols[i] = origToValueIdx[origCol];
                 } else {
                     inputCols[i] = -1;
                 }

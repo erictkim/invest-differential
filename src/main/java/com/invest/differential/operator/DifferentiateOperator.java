@@ -45,6 +45,12 @@ public final class DifferentiateOperator implements Operator {
     }
 
     @Override
+    public void close() {
+        if (previous != null) { previous.close(); previous = null; }
+        output.clear();
+    }
+
+    @Override
     public Stream getOutput() { return output; }
 
     @Override

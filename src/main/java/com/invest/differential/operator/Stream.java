@@ -21,10 +21,16 @@ public final class Stream {
     public ZSet getValue() { return currentValue; }
 
     public void setValue(ZSet value) {
+        if (this.currentValue != null && this.currentValue != value) {
+            this.currentValue.close();
+        }
         this.currentValue = value;
     }
 
     public void clear() {
+        if (this.currentValue != null) {
+            this.currentValue.close();
+        }
         this.currentValue = null;
     }
 }

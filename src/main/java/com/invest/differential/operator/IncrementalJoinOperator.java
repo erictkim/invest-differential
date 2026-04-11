@@ -127,6 +127,13 @@ public final class IncrementalJoinOperator implements Operator {
     }
 
     @Override
+    public void close() {
+        if (leftState != null) { leftState.close(); leftState = null; }
+        if (rightState != null) { rightState.close(); rightState = null; }
+        output.clear();
+    }
+
+    @Override
     public Stream getOutput() { return output; }
 
     @Override

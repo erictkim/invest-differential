@@ -51,4 +51,13 @@ public final class Circuit {
         }
         throw new IllegalArgumentException("No input operator for table: " + tableName);
     }
+
+    /**
+     * Close all operator state and release Arrow resources.
+     */
+    public void close() {
+        for (Operator op : operators) {
+            op.close();
+        }
+    }
 }

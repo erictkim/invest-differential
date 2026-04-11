@@ -57,7 +57,7 @@ class CircuitTest {
         });
         circuit.addOperator(filter);
 
-        OutputOperator output = new OutputOperator("result", filter.getOutput());
+        OutputOperator output = new OutputOperator("result", filter.getOutput(), allocator);
         circuit.addOperator(output);
 
         // Step 1: insert {1,2,3,4,5}
@@ -84,7 +84,7 @@ class CircuitTest {
         });
         circuit.addOperator(project);
 
-        OutputOperator output = new OutputOperator("result", project.getOutput());
+        OutputOperator output = new OutputOperator("result", project.getOutput(), allocator);
         circuit.addOperator(output);
 
         input.setValue(ZSet.fromData(intSchema, allocator, new Object[][]{{5}, {10}}));
@@ -104,7 +104,7 @@ class CircuitTest {
         IntegrateOperator integrate = new IntegrateOperator(input.getOutput(), allocator);
         circuit.addOperator(integrate);
 
-        OutputOperator output = new OutputOperator("result", integrate.getOutput());
+        OutputOperator output = new OutputOperator("result", integrate.getOutput(), allocator);
         circuit.addOperator(output);
 
         // Step 1: insert {1, 2}
@@ -131,7 +131,7 @@ class CircuitTest {
         DifferentiateOperator diff = new DifferentiateOperator(input.getOutput(), allocator);
         circuit.addOperator(diff);
 
-        OutputOperator output = new OutputOperator("result", diff.getOutput());
+        OutputOperator output = new OutputOperator("result", diff.getOutput(), allocator);
         circuit.addOperator(output);
 
         // D(s[t]) = s[t] - s[t-1]
@@ -160,7 +160,7 @@ class CircuitTest {
         IncrementalDistinctOperator distinct = new IncrementalDistinctOperator(input.getOutput(), allocator);
         circuit.addOperator(distinct);
 
-        OutputOperator output = new OutputOperator("result", distinct.getOutput());
+        OutputOperator output = new OutputOperator("result", distinct.getOutput(), allocator);
         circuit.addOperator(output);
 
         // Step 1: insert {1, 1, 2, 3}
@@ -222,7 +222,7 @@ class CircuitTest {
                 IncrementalJoinOperator.JoinType.INNER, allocator);
         circuit.addOperator(join);
 
-        OutputOperator output = new OutputOperator("result", join.getOutput());
+        OutputOperator output = new OutputOperator("result", join.getOutput(), allocator);
         circuit.addOperator(output);
 
         // Step 1: left={1,"alice"}, right={1,100}
@@ -287,7 +287,7 @@ class CircuitTest {
                 resultValueSchema, resultToRow, allocator);
         circuit.addOperator(aggOp);
 
-        OutputOperator output = new OutputOperator("result", aggOp.getOutput());
+        OutputOperator output = new OutputOperator("result", aggOp.getOutput(), allocator);
         circuit.addOperator(output);
 
         // Step 1: insert alice=100, bob=200
@@ -321,7 +321,7 @@ class CircuitTest {
         UnionAllOperator union = new UnionAllOperator(left.getOutput(), right.getOutput());
         circuit.addOperator(union);
 
-        OutputOperator output = new OutputOperator("result", union.getOutput());
+        OutputOperator output = new OutputOperator("result", union.getOutput(), allocator);
         circuit.addOperator(output);
 
         left.setValue(ZSet.fromData(intSchema, allocator, new Object[][]{{1}, {2}}));
@@ -342,7 +342,7 @@ class CircuitTest {
         IntegrateOperator integrate = new IntegrateOperator(input.getOutput(), allocator);
         circuit.addOperator(integrate);
 
-        OutputOperator output = new OutputOperator("result", integrate.getOutput());
+        OutputOperator output = new OutputOperator("result", integrate.getOutput(), allocator);
         circuit.addOperator(output);
 
         // Accumulate state

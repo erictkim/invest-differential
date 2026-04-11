@@ -7,8 +7,11 @@ public interface Operator {
     /** Execute one step: compute output from current inputs. */
     void step();
 
-    /** Reset all internal state. */
+    /** Reset all internal state (keeps operator ready for reuse). */
     void reset();
+
+    /** Release all resources. After close(), the operator cannot be used. */
+    default void close() { reset(); }
 
     /** The output stream of this operator. */
     Stream getOutput();
