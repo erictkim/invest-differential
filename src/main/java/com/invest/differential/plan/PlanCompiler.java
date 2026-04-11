@@ -10,6 +10,7 @@ import com.invest.differential.zset.RowPredicate;
 import io.substrait.expression.AggregateFunctionInvocation;
 import io.substrait.expression.Expression;
 import io.substrait.expression.FieldReference;
+import io.substrait.expression.WindowBound;
 import io.substrait.plan.Plan;
 import io.substrait.relation.*;
 import io.substrait.type.NamedStruct;
@@ -70,6 +71,8 @@ public final class PlanCompiler {
             return compileCross(cross);
         } else if (rel instanceof io.substrait.relation.Set set) {
             return compileSet(set);
+        } else if (rel instanceof ConsistentPartitionWindow window) {
+            return compileWindow(window);
         } else if (rel instanceof Sort sort) {
             // Sort is a pass-through for incremental views (ordering doesn't affect correctness)
             return compileRel(sort.getInput());
@@ -123,12 +126,6 @@ public final class PlanCompiler {
         int inputCols = inputSchema.getFields().size();
         int totalCols = inputCols + expressions.size();
 
-        // Compile the new expression evaluators (they index into the input schema)
-        List<ExpressionEvaluator> exprEvals = new ArrayList<>();
-        for (Expression expr : expressions) {
-            exprEvals.add(compileExpression(expr, inputSchema));
-        }
-
         // Determine output columns
         int[] emitIndices;
         if (remap != null) {
@@ -136,6 +133,20 @@ public final class PlanCompiler {
         } else {
             emitIndices = new int[totalCols];
             for (int i = 0; i < totalCols; i++) emitIndices[i] = i;
+        }
+
+        // Check if any expression is a WindowFunctionInvocation
+        boolean hasWindowFunctions = expressions.stream()
+                .anyMatch(e -> e instanceof Expression.WindowFunctionInvocation);
+
+        if (hasWindowFunctions) {
+            return compileProjectWithWindow(input, expressions, inputSchema, emitIndices);
+        }
+
+        // Compile the new expression evaluators (they index into the input schema)
+        List<ExpressionEvaluator> exprEvals = new ArrayList<>();
+        for (Expression expr : expressions) {
+            exprEvals.add(compileExpression(expr, inputSchema));
         }
 
         // Build output schema
@@ -169,6 +180,222 @@ public final class PlanCompiler {
         ProjectOperator projectOp = new ProjectOperator(input, outputDataSchema, mapper);
         circuit.addOperator(projectOp);
         return projectOp.getOutput();
+    }
+
+    /**
+     * Compile a Project that contains WindowFunctionInvocation expressions.
+     * Converts the window expressions into an IncrementalWindowOperator, then
+     * applies a ProjectOperator for any non-window expressions and emit mapping.
+     */
+    private Stream compileProjectWithWindow(Stream input, List<Expression> expressions,
+                                             Schema inputSchema, int[] emitIndices) {
+        int inputCols = inputSchema.getFields().size();
+
+        // Separate window functions from scalar expressions.
+        // All window functions sharing same partition/sort go into one IncrementalWindowOperator.
+        // Window functions with different partition/sort each get their own operator.
+        // For simplicity, group by (partition+sort) signature.
+        Map<String, List<Integer>> windowGroups = new LinkedHashMap<>();
+        for (int i = 0; i < expressions.size(); i++) {
+            Expression expr = expressions.get(i);
+            if (expr instanceof Expression.WindowFunctionInvocation wfi) {
+                String key = windowGroupKey(wfi);
+                windowGroups.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
+            }
+        }
+
+        // Process window groups: chain window operators on top of input
+        Stream current = input;
+        Schema currentSchema = inputSchema;
+
+        // Track mapping: original expression index → column index in current schema
+        int[] exprToOutputCol = new int[expressions.size()];
+        java.util.Arrays.fill(exprToOutputCol, -1);
+
+        for (Map.Entry<String, List<Integer>> entry : windowGroups.entrySet()) {
+            List<Integer> exprIndices = entry.getValue();
+            Expression.WindowFunctionInvocation representative =
+                    (Expression.WindowFunctionInvocation) expressions.get(exprIndices.get(0));
+
+            // Partition columns
+            List<Expression> partExprs = representative.partitionBy();
+            int[] partitionColumns = new int[partExprs.size()];
+            for (int i = 0; i < partExprs.size(); i++) {
+                if (partExprs.get(i) instanceof FieldReference ref) {
+                    partitionColumns[i] = resolveFieldIndex(ref);
+                } else {
+                    throw new UnsupportedOperationException("Only field references supported in PARTITION BY");
+                }
+            }
+
+            // Order columns
+            List<Expression.SortField> sorts = representative.sort();
+            int[] orderColumns = new int[sorts.size()];
+            boolean[] orderAscending = new boolean[sorts.size()];
+            for (int i = 0; i < sorts.size(); i++) {
+                Expression.SortField sf = sorts.get(i);
+                if (sf.expr() instanceof FieldReference ref) {
+                    orderColumns[i] = resolveFieldIndex(ref);
+                } else {
+                    throw new UnsupportedOperationException("Only field references supported in ORDER BY");
+                }
+                orderAscending[i] = sf.direction() == Expression.SortDirection.ASC_NULLS_FIRST
+                        || sf.direction() == Expression.SortDirection.ASC_NULLS_LAST;
+            }
+
+            // Build window function specs
+            List<IncrementalWindowOperator.WindowFunctionSpec> specs = new ArrayList<>();
+            List<Field> outputFields = new ArrayList<>(currentSchema.getFields());
+            int windowOutputStart = currentSchema.getFields().size();
+
+            for (int idx : exprIndices) {
+                Expression.WindowFunctionInvocation wfi =
+                        (Expression.WindowFunctionInvocation) expressions.get(idx);
+                String funcName = wfi.declaration().name().split(":")[0];
+
+                int inputCol = -1;
+                if (!wfi.arguments().isEmpty()) {
+                    io.substrait.expression.FunctionArg firstArg = wfi.arguments().get(0);
+                    if (firstArg instanceof Expression argExpr && argExpr instanceof FieldReference ref) {
+                        inputCol = resolveFieldIndex(ref);
+                    }
+                }
+
+                IncrementalWindowOperator.BoundType lowerType = toBoundType(wfi.lowerBound(), true);
+                int lowerOffset = toBoundOffset(wfi.lowerBound());
+                IncrementalWindowOperator.BoundType upperType = toBoundType(wfi.upperBound(), false);
+                int upperOffset = toBoundOffset(wfi.upperBound());
+
+                specs.add(new IncrementalWindowOperator.WindowFunctionSpec(
+                        funcName, inputCol, lowerType, lowerOffset, upperType, upperOffset));
+
+                String fieldName = "w_" + funcName + "_" + idx;
+                outputFields.add(SubstraitTypeMapper.toArrowField(fieldName, wfi.outputType()));
+                exprToOutputCol[idx] = windowOutputStart + specs.size() - 1;
+            }
+
+            Schema windowOutputSchema = new Schema(outputFields);
+
+            IncrementalWindowOperator windowOp = new IncrementalWindowOperator(
+                    current, windowOutputSchema, partitionColumns, orderColumns, orderAscending,
+                    specs, allocator);
+            circuit.addOperator(windowOp);
+            current = windowOp.getOutput();
+            currentSchema = windowOutputSchema;
+        }
+
+        // Now build final emit projection:
+        // Map emitIndices through the augmented schema.
+        // emitIndices reference (original input columns | expression columns).
+        // For input columns → pass through from currentSchema.
+        // For window expression columns → use exprToOutputCol mapping.
+        // For scalar expression columns → evaluate in final project.
+
+        // Check if we need a final project (for scalar expressions or re-ordering)
+        boolean needsFinalProject = false;
+        for (int emitIdx : emitIndices) {
+            if (emitIdx >= inputCols) {
+                int exprIdx = emitIdx - inputCols;
+                if (!(expressions.get(exprIdx) instanceof Expression.WindowFunctionInvocation)) {
+                    needsFinalProject = true;
+                    break;
+                }
+            }
+        }
+        // Also need project if emit doesn't match current schema 1:1
+        if (emitIndices.length != currentSchema.getFields().size()) {
+            needsFinalProject = true;
+        } else {
+            for (int i = 0; i < emitIndices.length; i++) {
+                int emitIdx = emitIndices[i];
+                int mappedCol;
+                if (emitIdx < inputCols) {
+                    mappedCol = emitIdx;
+                } else {
+                    mappedCol = exprToOutputCol[emitIdx - inputCols];
+                }
+                if (mappedCol != i) {
+                    needsFinalProject = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needsFinalProject) {
+            // The window operator output is exactly what we want
+            return current;
+        }
+
+        // Build final output schema and project mapper
+        List<Field> finalFields = new ArrayList<>();
+        int[] finalMappedCols = new int[emitIndices.length];
+        List<ExpressionEvaluator> scalarEvals = new ArrayList<>();
+        boolean[] isScalar = new boolean[emitIndices.length];
+
+        for (int i = 0; i < emitIndices.length; i++) {
+            int emitIdx = emitIndices[i];
+            if (emitIdx < inputCols) {
+                finalMappedCols[i] = emitIdx;
+                finalFields.add(currentSchema.getFields().get(emitIdx));
+            } else {
+                int exprIdx = emitIdx - inputCols;
+                Expression expr = expressions.get(exprIdx);
+                if (expr instanceof Expression.WindowFunctionInvocation) {
+                    finalMappedCols[i] = exprToOutputCol[exprIdx];
+                    finalFields.add(currentSchema.getFields().get(exprToOutputCol[exprIdx]));
+                } else {
+                    isScalar[i] = true;
+                    scalarEvals.add(compileExpression(expr, inputSchema));
+                    String name = "expr_" + exprIdx;
+                    finalFields.add(SubstraitTypeMapper.toArrowField(name, expr.getType()));
+                }
+            }
+        }
+
+        Schema finalOutputSchema = new Schema(finalFields);
+        final Schema projInputSchema = currentSchema;
+        int scalarIdx = 0;
+        ExpressionEvaluator[] scalarArray = scalarEvals.toArray(new ExpressionEvaluator[0]);
+        // Pre-compute scalar eval indices
+        int[] scalarEvalMap = new int[emitIndices.length];
+        int sIdx = 0;
+        for (int i = 0; i < emitIndices.length; i++) {
+            if (isScalar[i]) {
+                scalarEvalMap[i] = sIdx++;
+            }
+        }
+
+        RowMapper mapper = (root, rowIndex) -> {
+            Object[] values = new Object[emitIndices.length];
+            for (int i = 0; i < emitIndices.length; i++) {
+                if (isScalar[i]) {
+                    values[i] = scalarArray[scalarEvalMap[i]].evaluate(root, rowIndex);
+                } else {
+                    values[i] = ArrowUtils.getValue(root.getVector(finalMappedCols[i]), rowIndex);
+                }
+            }
+            return values;
+        };
+
+        ProjectOperator projectOp = new ProjectOperator(current, finalOutputSchema, mapper);
+        circuit.addOperator(projectOp);
+        return projectOp.getOutput();
+    }
+
+    private String windowGroupKey(Expression.WindowFunctionInvocation wfi) {
+        StringBuilder sb = new StringBuilder();
+        for (Expression e : wfi.partitionBy()) {
+            if (e instanceof FieldReference ref) {
+                sb.append("p").append(resolveFieldIndex(ref));
+            }
+        }
+        sb.append("|");
+        for (Expression.SortField sf : wfi.sort()) {
+            if (sf.expr() instanceof FieldReference ref) {
+                sb.append("s").append(resolveFieldIndex(ref)).append(sf.direction().name());
+            }
+        }
+        return sb.toString();
     }
 
     private Stream compileAggregate(Aggregate aggregate) {
@@ -540,6 +767,113 @@ public final class PlanCompiler {
             }
             default -> throw new UnsupportedOperationException("Unsupported set operation: " + set.getSetOp());
         };
+    }
+
+    private Stream compileWindow(ConsistentPartitionWindow window) {
+        Stream input = compileRel(window.getInput());
+        Schema inputSchema = input.dataSchema();
+
+        // Partition-by columns
+        List<Expression> partExprs = window.getPartitionExpressions();
+        int[] partitionColumns = new int[partExprs.size()];
+        for (int i = 0; i < partExprs.size(); i++) {
+            if (partExprs.get(i) instanceof FieldReference ref) {
+                partitionColumns[i] = resolveFieldIndex(ref);
+            } else {
+                throw new UnsupportedOperationException("Only field references supported in PARTITION BY");
+            }
+        }
+
+        // Order-by columns
+        List<Expression.SortField> sorts = window.getSorts();
+        int[] orderColumns = new int[sorts.size()];
+        boolean[] orderAscending = new boolean[sorts.size()];
+        for (int i = 0; i < sorts.size(); i++) {
+            Expression.SortField sf = sorts.get(i);
+            if (sf.expr() instanceof FieldReference ref) {
+                orderColumns[i] = resolveFieldIndex(ref);
+            } else {
+                throw new UnsupportedOperationException("Only field references supported in ORDER BY");
+            }
+            orderAscending[i] = sf.direction() == Expression.SortDirection.ASC_NULLS_FIRST
+                    || sf.direction() == Expression.SortDirection.ASC_NULLS_LAST;
+        }
+
+        // Window functions
+        List<ConsistentPartitionWindow.WindowRelFunctionInvocation> winFuncs = window.getWindowFunctions();
+        List<IncrementalWindowOperator.WindowFunctionSpec> specs = new ArrayList<>();
+        List<Field> outputFields = new ArrayList<>(inputSchema.getFields());
+
+        for (int i = 0; i < winFuncs.size(); i++) {
+            ConsistentPartitionWindow.WindowRelFunctionInvocation wf = winFuncs.get(i);
+            String funcName = wf.declaration().name().split(":")[0];
+
+            // Resolve input column for aggregate window functions
+            int inputCol = -1;
+            if (!wf.arguments().isEmpty()) {
+                io.substrait.expression.FunctionArg firstArg = wf.arguments().get(0);
+                if (firstArg instanceof Expression argExpr && argExpr instanceof FieldReference ref) {
+                    inputCol = resolveFieldIndex(ref);
+                }
+            }
+
+            // Resolve window bounds
+            IncrementalWindowOperator.BoundType lowerType = toBoundType(wf.lowerBound(), true);
+            int lowerOffset = toBoundOffset(wf.lowerBound());
+            IncrementalWindowOperator.BoundType upperType = toBoundType(wf.upperBound(), false);
+            int upperOffset = toBoundOffset(wf.upperBound());
+
+            specs.add(new IncrementalWindowOperator.WindowFunctionSpec(
+                    funcName, inputCol, lowerType, lowerOffset, upperType, upperOffset));
+
+            // Add output field
+            String fieldName = "w" + i + "_" + funcName;
+            Type outputType = wf.outputType();
+            outputFields.add(SubstraitTypeMapper.toArrowField(fieldName, outputType));
+        }
+
+        Schema outputDataSchema = new Schema(outputFields);
+
+        // Handle emit mapping
+        Rel.Remap remap = window.getRemap().orElse(null);
+        if (remap != null) {
+            int[] emitIndices = remap.indices().stream().mapToInt(Integer::intValue).toArray();
+            List<Field> remapped = new ArrayList<>();
+            for (int idx : emitIndices) {
+                remapped.add(outputFields.get(idx));
+            }
+            outputDataSchema = new Schema(remapped);
+        }
+
+        IncrementalWindowOperator windowOp = new IncrementalWindowOperator(
+                input, outputDataSchema, partitionColumns, orderColumns, orderAscending,
+                specs, allocator);
+        circuit.addOperator(windowOp);
+        return windowOp.getOutput();
+    }
+
+    private IncrementalWindowOperator.BoundType toBoundType(WindowBound bound, boolean isLower) {
+        if (bound instanceof WindowBound.Unbounded) {
+            return isLower ? IncrementalWindowOperator.BoundType.UNBOUNDED_PRECEDING
+                           : IncrementalWindowOperator.BoundType.UNBOUNDED_FOLLOWING;
+        } else if (bound instanceof WindowBound.CurrentRow) {
+            return IncrementalWindowOperator.BoundType.CURRENT_ROW;
+        } else if (bound instanceof WindowBound.Preceding) {
+            return IncrementalWindowOperator.BoundType.PRECEDING;
+        } else if (bound instanceof WindowBound.Following) {
+            return IncrementalWindowOperator.BoundType.FOLLOWING;
+        }
+        return isLower ? IncrementalWindowOperator.BoundType.UNBOUNDED_PRECEDING
+                       : IncrementalWindowOperator.BoundType.UNBOUNDED_FOLLOWING;
+    }
+
+    private int toBoundOffset(WindowBound bound) {
+        if (bound instanceof WindowBound.Preceding p) {
+            return (int) p.offset();
+        } else if (bound instanceof WindowBound.Following f) {
+            return (int) f.offset();
+        }
+        return 0;
     }
 
     // ---- Expression Compiler ----
