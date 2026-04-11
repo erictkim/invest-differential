@@ -117,6 +117,7 @@ public final class IncrementalEngine implements AutoCloseable {
 
     /**
      * Push a delta (change set) for a table.
+     * Takes ownership of the delta — the caller must not use it after this call.
      */
     public IncrementalEngine pushChanges(String tableName, ZSet delta) {
         ensureCompiled();
@@ -124,10 +125,7 @@ public final class IncrementalEngine implements AutoCloseable {
         if (input == null) {
             throw new IllegalArgumentException("Unknown table: " + tableName);
         }
-        // Clone the delta so the caller retains ownership of the original
-        ZSet cloned = ZSet.fromRoot(delta.dataSchema(),
-                ArrowUtils.cloneRoot(delta.data(), allocator), allocator);
-        input.setValue(cloned);
+        input.setValue(delta);
         return this;
     }
 

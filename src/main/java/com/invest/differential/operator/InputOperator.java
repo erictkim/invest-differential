@@ -12,6 +12,7 @@ public final class InputOperator implements Operator {
     private final String tableName;
     private final Stream output;
     private final BufferAllocator allocator;
+    private ZSet pending; // set externally between steps
 
     public InputOperator(String tableName, Schema dataSchema, BufferAllocator allocator) {
         this.tableName = tableName;
@@ -20,13 +21,19 @@ public final class InputOperator implements Operator {
     }
 
     public void setValue(ZSet delta) {
-        output.setValue(delta);
+        if (this.pending != null) {
+            this.pending.close();
+        }
+        this.pending = delta;
     }
 
     @Override
     public void step() {
-        // InputOperator's value is set externally; if no value set, emit empty
-        if (output.getValue() == null) {
+        // Emit pending delta, or empty if nothing was pushed since last step
+        if (pending != null) {
+            output.setValue(pending);
+            pending = null;
+        } else {
             output.setValue(ZSet.empty(output.dataSchema(), allocator));
         }
     }
