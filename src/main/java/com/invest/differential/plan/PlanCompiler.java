@@ -3,6 +3,7 @@ package com.invest.differential.plan;
 import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.expr.*;
 import com.invest.differential.operator.*;
+import com.invest.differential.udf.AggregateUdf;
 import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.AggregateDescription;
 import com.invest.differential.zset.RowCombiner;
@@ -518,7 +519,10 @@ public final class PlanCompiler {
                 case "min" -> null;
                 case "max" -> null;
                 case "avg" -> new long[]{0L, 0L}; // {sum, count}
-                default -> 0L;
+                default -> {
+                    AggregateUdf udaf = resolveUdaf(funcName);
+                    yield udaf != null ? udaf.initialize() : 0L;
+                }
             };
         }
 
@@ -586,7 +590,13 @@ public final class PlanCompiler {
                 }
                 yield result;
             }
-            default -> acc;
+            default -> {
+                AggregateUdf udaf = resolveUdaf(funcName);
+                if (udaf != null && inputCol >= 0 && inputCol < values.length) {
+                    yield udaf.accumulate(acc, values[inputCol], weight);
+                }
+                yield acc;
+            }
         };
     }
 
@@ -599,8 +609,17 @@ public final class PlanCompiler {
                 long[] state = acc instanceof long[] l ? l : new long[]{0L, 0L};
                 yield state[1] == 0 ? null : state[0] / state[1];
             }
-            default -> acc;
+            default -> {
+                AggregateUdf udaf = resolveUdaf(funcName);
+                yield udaf != null ? udaf.finalize(acc) : acc;
+            }
         };
+    }
+
+    private AggregateUdf resolveUdaf(String funcName) {
+        if (udfRegistry == null) return null;
+        UdfRegistry.UdafEntry entry = udfRegistry.getUdaf(funcName);
+        return entry != null ? entry.implementation() : null;
     }
 
     private Stream compileJoin(Join join) {

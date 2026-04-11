@@ -5,6 +5,7 @@ import com.invest.differential.operator.Circuit;
 import com.invest.differential.operator.InputOperator;
 import com.invest.differential.operator.OutputOperator;
 import com.invest.differential.plan.PlanCompiler;
+import com.invest.differential.udf.AggregateUdf;
 import com.invest.differential.udf.ScalarUdf;
 import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.ZSet;
@@ -87,6 +88,22 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Register a user-defined aggregate function (UDAF). Must be called before query compilation.
+     *
+     * @param name       function name (case-insensitive in SQL)
+     * @param impl       aggregate function implementation
+     * @param argType    Substrait type name for the argument ("string", "i32", "i64", "fp64", "boolean")
+     * @param returnType Substrait type name for the return value
+     */
+    public IncrementalEngine registerUdaf(String name, AggregateUdf impl, String argType, String returnType) {
+        if (compiled) {
+            throw new IllegalStateException("Cannot register UDAFs after compilation");
+        }
+        udfRegistry.registerUdaf(name, impl, argType, returnType);
+        return this;
+    }
+
+    /**
      * Get the UDF registry (for advanced usage).
      */
     public UdfRegistry getUdfRegistry() {
@@ -110,6 +127,7 @@ public final class IncrementalEngine implements AutoCloseable {
             UdfSqlToSubstrait converter = new UdfSqlToSubstrait(
                     udfRegistry.buildOperatorTable(),
                     udfRegistry.buildSigs(),
+                    udfRegistry.buildAggSigs(),
                     extensions);
             protoPlan = converter.execute(sqlQuery, createStatements);
 

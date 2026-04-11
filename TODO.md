@@ -22,7 +22,7 @@ Semi-joins (`IN (subquery)`) and anti-joins are now supported via `IncrementalJo
 ### 6. LIMIT/OFFSET (Fetch)
 Currently throws `UnsupportedOperationException`. While tricky for incremental semantics (requires maintained ordering), a top-K operator is feasible.
 
-### 7. Aggregate UDFs (UDAFs)
+### 7. ~~Aggregate UDFs (UDAFs)~~ ✅
 Only scalar UDFs exist in `UdfRegistry`. Allowing user-defined aggregate functions (`registerUdaf`) would unlock custom analytics.
 
 ### 8. Multi-Query Support

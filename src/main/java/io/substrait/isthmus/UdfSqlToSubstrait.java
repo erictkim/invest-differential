@@ -41,20 +41,36 @@ public class UdfSqlToSubstrait extends SqlConverterBase {
 
     private final SimpleExtension.ExtensionCollection mergedExtensions;
     private final List<FunctionMappings.Sig> additionalSigs;
+    private final List<FunctionMappings.Sig> additionalAggSigs;
     private final SqlOperatorTable udfOperatorTable;
 
     /**
-     * @param udfOperatorTable  Calcite operator table containing only UDF functions
-     * @param additionalSigs    FunctionMappings.Sig entries mapping UDF SqlFunctions to Substrait names
-     * @param mergedExtensions  Substrait extension collection including both default + UDF functions
+     * @param udfOperatorTable  Calcite operator table containing UDF/UDAF functions
+     * @param additionalSigs    FunctionMappings.Sig entries mapping scalar UDF SqlFunctions to Substrait names
+     * @param mergedExtensions  Substrait extension collection including both default + UDF/UDAF functions
      */
     public UdfSqlToSubstrait(
             SqlOperatorTable udfOperatorTable,
             List<FunctionMappings.Sig> additionalSigs,
             SimpleExtension.ExtensionCollection mergedExtensions) {
+        this(udfOperatorTable, additionalSigs, List.of(), mergedExtensions);
+    }
+
+    /**
+     * @param udfOperatorTable   Calcite operator table containing UDF/UDAF functions
+     * @param additionalSigs     FunctionMappings.Sig entries mapping scalar UDF SqlFunctions to Substrait names
+     * @param additionalAggSigs  FunctionMappings.Sig entries mapping UDAF SqlAggFunctions to Substrait names
+     * @param mergedExtensions   Substrait extension collection including both default + UDF/UDAF functions
+     */
+    public UdfSqlToSubstrait(
+            SqlOperatorTable udfOperatorTable,
+            List<FunctionMappings.Sig> additionalSigs,
+            List<FunctionMappings.Sig> additionalAggSigs,
+            SimpleExtension.ExtensionCollection mergedExtensions) {
         super(null);
         this.udfOperatorTable = udfOperatorTable;
         this.additionalSigs = additionalSigs;
+        this.additionalAggSigs = additionalAggSigs;
         this.mergedExtensions = mergedExtensions;
     }
 
@@ -132,7 +148,10 @@ public class UdfSqlToSubstrait extends SqlConverterBase {
                 TypeConverter.DEFAULT);
 
         AggregateFunctionConverter aggregateConverter = new AggregateFunctionConverter(
-                mergedExtensions.aggregateFunctions(), typeFactory);
+                mergedExtensions.aggregateFunctions(),
+                additionalAggSigs,
+                typeFactory,
+                TypeConverter.DEFAULT);
 
         WindowFunctionConverter windowConverter = new WindowFunctionConverter(
                 mergedExtensions.windowFunctions(), typeFactory);

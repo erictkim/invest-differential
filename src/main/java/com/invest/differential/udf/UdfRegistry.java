@@ -13,9 +13,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Registry for user-defined scalar functions.
+ * Registry for user-defined scalar and aggregate functions.
  *
- * <p>Registered UDFs are available in both SQL queries (via Calcite) and
+ * <p>Registered UDFs/UDAFs are available in both SQL queries (via Calcite) and
  * Substrait plans (via custom extensions).
  */
 public final class UdfRegistry {
@@ -23,6 +23,7 @@ public final class UdfRegistry {
     private static final String UDF_EXTENSION_URI = "/functions_udf.yaml";
 
     private final Map<String, UdfEntry> udfs = new ConcurrentHashMap<>();
+    private final Map<String, UdafEntry> udafs = new ConcurrentHashMap<>();
 
     public static final class UdfEntry {
         private final String name;
@@ -61,16 +62,61 @@ public final class UdfRegistry {
         return this;
     }
 
+    public static final class UdafEntry {
+        private final String name;
+        private final AggregateUdf implementation;
+        private final String argType;
+        private final String returnType;
+        private final SqlAggFunction sqlAggFunction;
+
+        UdafEntry(String name, AggregateUdf implementation, String argType, String returnType, SqlAggFunction sqlAggFunction) {
+            this.name = name;
+            this.implementation = implementation;
+            this.argType = argType;
+            this.returnType = returnType;
+            this.sqlAggFunction = sqlAggFunction;
+        }
+
+        public String name() { return name; }
+        public AggregateUdf implementation() { return implementation; }
+        public String argType() { return argType; }
+        public String returnType() { return returnType; }
+        public SqlAggFunction sqlAggFunction() { return sqlAggFunction; }
+    }
+
+    /**
+     * Register an aggregate UDF (UDAF).
+     *
+     * @param name       function name (case-insensitive in SQL)
+     * @param impl       aggregate function implementation
+     * @param argType    Substrait type name for the argument ("string", "i32", "i64", "fp64", "boolean")
+     * @param returnType Substrait type name for the return value
+     */
+    public UdfRegistry registerUdaf(String name, AggregateUdf impl, String argType, String returnType) {
+        String lowerName = name.toLowerCase(Locale.ROOT);
+        SqlAggFunction sqlAggFunc = createCalciteSqlAggFunction(name, argType, returnType);
+        udafs.put(lowerName, new UdafEntry(lowerName, impl, argType, returnType, sqlAggFunc));
+        return this;
+    }
+
     public boolean isEmpty() {
-        return udfs.isEmpty();
+        return udfs.isEmpty() && udafs.isEmpty();
     }
 
     public UdfEntry get(String name) {
         return udfs.get(name.toLowerCase(Locale.ROOT));
     }
 
+    public UdafEntry getUdaf(String name) {
+        return udafs.get(name.toLowerCase(Locale.ROOT));
+    }
+
     public Collection<UdfEntry> all() {
         return Collections.unmodifiableCollection(udfs.values());
+    }
+
+    public Collection<UdafEntry> allUdafs() {
+        return Collections.unmodifiableCollection(udafs.values());
     }
 
     /**
@@ -80,6 +126,9 @@ public final class UdfRegistry {
         List<SqlOperator> ops = new ArrayList<>();
         for (UdfEntry entry : udfs.values()) {
             ops.add(entry.sqlFunction());
+        }
+        for (UdafEntry entry : udafs.values()) {
+            ops.add(entry.sqlAggFunction());
         }
         return SqlOperatorTables.of(ops);
     }
@@ -95,6 +144,14 @@ public final class UdfRegistry {
         return sigs;
     }
 
+    public List<FunctionMappings.Sig> buildAggSigs() {
+        List<FunctionMappings.Sig> sigs = new ArrayList<>();
+        for (UdafEntry entry : udafs.values()) {
+            sigs.add(FunctionMappings.s(entry.sqlAggFunction(), entry.name()));
+        }
+        return sigs;
+    }
+
     /**
      * Load a Substrait ExtensionCollection containing all registered UDFs,
      * merged with the default Substrait extensions.
@@ -102,7 +159,7 @@ public final class UdfRegistry {
     public SimpleExtension.ExtensionCollection buildMergedExtensions() {
         try {
             SimpleExtension.ExtensionCollection defaults = SimpleExtension.loadDefaults();
-            if (udfs.isEmpty()) {
+            if (udfs.isEmpty() && udafs.isEmpty()) {
                 return defaults;
             }
             String yaml = buildExtensionYaml();
@@ -117,18 +174,53 @@ public final class UdfRegistry {
 
     private String buildExtensionYaml() {
         StringBuilder sb = new StringBuilder();
-        sb.append("%YAML 1.2\n---\nscalar_functions:\n");
-        for (UdfEntry entry : udfs.values()) {
-            sb.append("  -\n");
-            sb.append("    name: \"").append(entry.name()).append("\"\n");
-            sb.append("    impls:\n");
-            sb.append("      - args:\n");
-            for (String argType : entry.argTypes()) {
-                sb.append("          - value: ").append(argType).append("\n");
+        sb.append("%YAML 1.2\n---\n");
+        if (!udfs.isEmpty()) {
+            sb.append("scalar_functions:\n");
+            for (UdfEntry entry : udfs.values()) {
+                sb.append("  -\n");
+                sb.append("    name: \"").append(entry.name()).append("\"\n");
+                sb.append("    impls:\n");
+                sb.append("      - args:\n");
+                for (String argType : entry.argTypes()) {
+                    sb.append("          - value: ").append(argType).append("\n");
+                }
+                sb.append("        return: ").append(entry.returnType()).append("\n");
             }
-            sb.append("        return: ").append(entry.returnType()).append("\n");
+        }
+        if (!udafs.isEmpty()) {
+            sb.append("aggregate_functions:\n");
+            for (UdafEntry entry : udafs.values()) {
+                sb.append("  -\n");
+                sb.append("    name: \"").append(entry.name()).append("\"\n");
+                sb.append("    impls:\n");
+                sb.append("      - args:\n");
+                sb.append("          - name: x\n");
+                sb.append("            value: ").append(entry.argType()).append("\n");
+                sb.append("        decomposable: NONE\n");
+                sb.append("        intermediate: ").append(entry.returnType()).append("\n");
+                sb.append("        return: ").append(entry.returnType()).append("\n");
+            }
         }
         return sb.toString();
+    }
+
+    private static SqlAggFunction createCalciteSqlAggFunction(String name, String argType, String returnType) {
+        SqlReturnTypeInference returnTypeInference = toReturnTypeInference(returnType);
+        SqlOperandTypeChecker operandTypeChecker = toOperandTypeChecker(new String[]{argType});
+
+        return new SqlAggFunction(
+                name.toUpperCase(Locale.ROOT),
+                null,
+                SqlKind.OTHER_FUNCTION,
+                returnTypeInference,
+                null,
+                operandTypeChecker,
+                SqlFunctionCategory.USER_DEFINED_FUNCTION,
+                false,
+                false,
+                org.apache.calcite.util.Optionality.FORBIDDEN) {
+        };
     }
 
     private static SqlFunction createCalciteSqlFunction(String name, String[] argTypes, String returnType) {
