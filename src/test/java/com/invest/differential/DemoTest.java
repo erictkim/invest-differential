@@ -1129,4 +1129,150 @@ class DemoTest {
             }
         }
     }
+
+    // ---- HAVING ----
+
+    @Test
+    void having_initialFilter() {
+        Schema schema = new Schema(List.of(
+                Field.notNullable("product", new ArrowType.Utf8()),
+                Field.notNullable("revenue", new ArrowType.Int(32, true))
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("sales", schema)
+                  .sql("SELECT product, SUM(revenue) as total FROM sales GROUP BY product HAVING SUM(revenue) > 100");
+
+            engine.pushChanges("sales", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"A", 50}, {"A", 80}, {"B", 30}, {"B", 20}, {"C", 200}
+            })).step();
+
+            try (ZSet delta = engine.getOutput()) {
+                delta.compact();
+                Map<List<Object>, Integer> rows = toMap(delta);
+                // A: 130 (passes), B: 50 (filtered), C: 200 (passes)
+                assertEquals(2, rows.size());
+                assertEquals(1, rows.get(List.of("A", 130)));
+                assertEquals(1, rows.get(List.of("C", 200)));
+            }
+        }
+    }
+
+    @Test
+    void having_groupCrossesThreshold() {
+        Schema schema = new Schema(List.of(
+                Field.notNullable("product", new ArrowType.Utf8()),
+                Field.notNullable("revenue", new ArrowType.Int(32, true))
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("sales", schema)
+                  .sql("SELECT product, SUM(revenue) as total FROM sales GROUP BY product HAVING SUM(revenue) > 100");
+
+            // Step 1: B is below threshold
+            engine.pushChanges("sales", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"A", 200}, {"B", 30}
+            })).step();
+
+            try (ZSet d1 = engine.getOutput()) {
+                d1.compact();
+                Map<List<Object>, Integer> rows = toMap(d1);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("A", 200)));
+            }
+
+            // Step 2: B crosses threshold with new revenue
+            engine.pushChanges("sales", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"B", 80}
+            })).step();
+
+            try (ZSet d2 = engine.getOutput()) {
+                d2.compact();
+                Map<List<Object>, Integer> rows = toMap(d2);
+                // B now totals 110 → appears in output
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("B", 110)));
+            }
+        }
+    }
+
+    @Test
+    void having_groupDropsBelowThreshold() {
+        Schema schema = new Schema(List.of(
+                Field.notNullable("product", new ArrowType.Utf8()),
+                Field.notNullable("revenue", new ArrowType.Int(32, true))
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("sales", schema)
+                  .sql("SELECT product, SUM(revenue) as total FROM sales GROUP BY product HAVING SUM(revenue) > 100");
+
+            // Step 1: A passes threshold
+            engine.pushChanges("sales", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"A", 120}
+            })).step();
+
+            try (ZSet d1 = engine.getOutput()) {
+                d1.compact();
+                assertEquals(1, d1.rowCount());
+                assertEquals(1, toMap(d1).get(List.of("A", 120)));
+            }
+
+            // Step 2: delete some A revenue → drops below threshold
+            ZSet del;
+            try (ZSet src = ZSet.fromData(schema, allocator, new Object[][]{{"A", 120}})) {
+                del = src.negate();
+            }
+            try (ZSet ins = ZSet.fromData(schema, allocator, new Object[][]{{"A", 50}})) {
+                ZSet combined = del.add(ins);
+                del.close();
+                engine.pushChanges("sales", combined).step();
+            }
+
+            try (ZSet d2 = engine.getOutput()) {
+                d2.compact();
+                Map<List<Object>, Integer> rows = toMap(d2);
+                // A old total retracted, A new total (50) doesn't pass HAVING
+                assertEquals(1, rows.size());
+                assertEquals(-1, rows.get(List.of("A", 120)));
+            }
+        }
+    }
+
+    @Test
+    void having_countFilter() {
+        Schema schema = new Schema(List.of(
+                Field.notNullable("category", new ArrowType.Utf8()),
+                Field.notNullable("item", new ArrowType.Utf8())
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("items", schema)
+                  .sql("SELECT category, COUNT(*) as cnt FROM items GROUP BY category HAVING COUNT(*) >= 2");
+
+            // Step 1: only "X" has 2+ items
+            engine.pushChanges("items", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"X", "a"}, {"X", "b"}, {"Y", "c"}
+            })).step();
+
+            try (ZSet d1 = engine.getOutput()) {
+                d1.compact();
+                Map<List<Object>, Integer> rows = toMap(d1);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("X", 2L)));
+            }
+
+            // Step 2: Y gets a second item → crosses threshold
+            engine.pushChanges("items", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"Y", "d"}
+            })).step();
+
+            try (ZSet d2 = engine.getOutput()) {
+                d2.compact();
+                Map<List<Object>, Integer> rows = toMap(d2);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("Y", 2L)));
+            }
+        }
+    }
 }
