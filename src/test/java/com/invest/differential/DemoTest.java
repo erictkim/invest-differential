@@ -52,6 +52,7 @@ class DemoTest {
             engine.registerTable("orders", schema)
                   .sql("SELECT customer, product, amount FROM orders WHERE amount > 100");
 
+            // Step 1: initial load
             engine.pushChanges("orders", ZSet.fromData(schema, allocator, new Object[][]{
                     {1, "Alice", "Laptop", 999},
                     {2, "Bob", "Mouse", 25},
@@ -59,12 +60,41 @@ class DemoTest {
                     {4, "Alice", "Keyboard", 75},
             })).step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(2, rows.size());
                 assertEquals(1, rows.get(List.of("Alice", "Laptop", 999)));
                 assertEquals(1, rows.get(List.of("Charlie", "Monitor", 349)));
+            }
+
+            // Step 2: add more orders — two qualify, one doesn't
+            engine.pushChanges("orders", ZSet.fromData(schema, allocator, new Object[][]{
+                    {5, "Bob", "Headphones", 199},
+                    {6, "Diana", "Desk", 450},
+                    {7, "Charlie", "Cable", 12},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(2, rows.size());
+                assertEquals(1, rows.get(List.of("Bob", "Headphones", 199)));
+                assertEquals(1, rows.get(List.of("Diana", "Desk", 450)));
+            }
+
+            // Step 3: delete Charlie's Monitor — retracted from view
+            ZSet deletion;
+            try (ZSet src = ZSet.fromData(schema, allocator, new Object[][]{{3, "Charlie", "Monitor", 349}})) {
+                deletion = src.negate();
+            }
+            engine.pushChanges("orders", deletion).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(1, rows.size());
+                assertEquals(-1, rows.get(List.of("Charlie", "Monitor", 349)));
             }
         }
     }
@@ -185,6 +215,7 @@ class DemoTest {
                   .sql("SELECT product, SUM(revenue) as total_revenue, COUNT(*) as num_sales " +
                        "FROM sales GROUP BY product");
 
+            // Step 1: initial load
             engine.pushChanges("sales", ZSet.fromData(schema, allocator, new Object[][]{
                     {1, "Widget", 50},
                     {2, "Gadget", 120},
@@ -193,13 +224,43 @@ class DemoTest {
                     {5, "Gizmo", 200},
             })).step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(3, rows.size());
                 assertEquals(1, rows.get(List.of("Widget", 125, 2L)));
                 assertEquals(1, rows.get(List.of("Gadget", 200, 2L)));
                 assertEquals(1, rows.get(List.of("Gizmo", 200, 1L)));
+            }
+
+            // Step 2: more Widget and Gadget sales
+            engine.pushChanges("sales", ZSet.fromData(schema, allocator, new Object[][]{
+                    {6, "Widget", 100},
+                    {7, "Gadget", 50},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(4, rows.size());
+                assertEquals(-1, rows.get(List.of("Widget", 125, 2L)));
+                assertEquals(1, rows.get(List.of("Widget", 225, 3L)));
+                assertEquals(-1, rows.get(List.of("Gadget", 200, 2L)));
+                assertEquals(1, rows.get(List.of("Gadget", 250, 3L)));
+            }
+
+            // Step 3: delete a Gizmo sale — group aggregate updates
+            ZSet del;
+            try (ZSet src = ZSet.fromData(schema, allocator, new Object[][]{{5, "Gizmo", 200}})) {
+                del = src.negate();
+            }
+            engine.pushChanges("sales", del).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(1, rows.size());
+                assertEquals(-1, rows.get(List.of("Gizmo", 200, 1L)));
             }
         }
     }
@@ -348,6 +409,7 @@ class DemoTest {
     @Test
     void join_initialLoad() {
         try (IncrementalEngine engine = createJoinEngine()) {
+            // Step 1: initial customers and orders
             engine.pushChanges("customers", ZSet.fromData(customersSchema(), allocator, new Object[][]{
                     {1, "Alice", "Gold"},
                     {2, "Bob", "Silver"},
@@ -360,13 +422,39 @@ class DemoTest {
             }));
             engine.step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(3, rows.size());
                 assertEquals(1, rows.get(List.of("Alice", "Gold", "Laptop", 999)));
                 assertEquals(1, rows.get(List.of("Alice", "Gold", "Monitor", 349)));
                 assertEquals(1, rows.get(List.of("Bob", "Silver", "Mouse", 25)));
+            }
+
+            // Step 2: Charlie places his first order
+            engine.pushChanges("orders", ZSet.fromData(ordersJoinSchema(), allocator, new Object[][]{
+                    {104, 3, "Keyboard", 75},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("Charlie", "Bronze", "Keyboard", 75)));
+            }
+
+            // Step 3: delete Alice's Monitor order
+            ZSet orderDel;
+            try (ZSet src = ZSet.fromData(ordersJoinSchema(), allocator, new Object[][]{{103, 1, "Monitor", 349}})) {
+                orderDel = src.negate();
+            }
+            engine.pushChanges("orders", orderDel).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(1, rows.size());
+                assertEquals(-1, rows.get(List.of("Alice", "Gold", "Monitor", 349)));
             }
         }
     }
@@ -491,6 +579,7 @@ class DemoTest {
                        "FROM orders o JOIN customers c ON o.cust_id = c.cust_id " +
                        "WHERE o.price > 200");
 
+            // Step 1: initial load
             engine.pushChanges("customers", ZSet.fromData(customers, allocator, new Object[][]{
                     {1, "Alice"}, {2, "Bob"},
             }));
@@ -502,12 +591,38 @@ class DemoTest {
             }));
             engine.step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(2, rows.size());
                 assertEquals(1, rows.get(List.of("Alice", "Phone", 699)));
                 assertEquals(1, rows.get(List.of("Bob", "TV", 1200)));
+            }
+
+            // Step 2: Bob buys a high-value Laptop
+            engine.pushChanges("orders", ZSet.fromData(orders, allocator, new Object[][]{
+                    {14, 2, "Laptop", 999},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("Bob", "Laptop", 999)));
+            }
+
+            // Step 3: delete Alice's Phone — retracted from high-value view
+            ZSet phoneDel;
+            try (ZSet src = ZSet.fromData(orders, allocator, new Object[][]{{10, 1, "Phone", 699}})) {
+                phoneDel = src.negate();
+            }
+            engine.pushChanges("orders", phoneDel).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(1, rows.size());
+                assertEquals(-1, rows.get(List.of("Alice", "Phone", 699)));
             }
         }
     }
@@ -577,6 +692,7 @@ class DemoTest {
                   .sql("SELECT category, COUNT(*) as cnt " +
                        "FROM txns WHERE amount >= 50 GROUP BY category");
 
+            // Step 1: initial load
             engine.pushChanges("txns", ZSet.fromData(txns, allocator, new Object[][]{
                     {1, "Food", 30},
                     {2, "Food", 80},
@@ -586,13 +702,41 @@ class DemoTest {
                     {6, "Entertainment", 60},
             })).step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(3, rows.size());
                 assertEquals(1, rows.get(List.of("Food", 1L)));
                 assertEquals(1, rows.get(List.of("Transport", 1L)));
                 assertEquals(1, rows.get(List.of("Entertainment", 2L)));
+            }
+
+            // Step 2: two more Food transactions above threshold
+            engine.pushChanges("txns", ZSet.fromData(txns, allocator, new Object[][]{
+                    {7, "Food", 65},
+                    {8, "Food", 90},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(2, rows.size());
+                assertEquals(-1, rows.get(List.of("Food", 1L)));
+                assertEquals(1, rows.get(List.of("Food", 3L)));
+            }
+
+            // Step 3: delete the only qualifying Transport txn
+            ZSet deletion;
+            try (ZSet src = ZSet.fromData(txns, allocator, new Object[][]{{3, "Transport", 55}})) {
+                deletion = src.negate();
+            }
+            engine.pushChanges("txns", deletion).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(1, rows.size());
+                assertEquals(-1, rows.get(List.of("Transport", 1L)));
             }
         }
     }
@@ -655,19 +799,50 @@ class DemoTest {
             engine.registerTable("line_items", schema)
                   .sql("SELECT product, price * qty as total FROM line_items");
 
+            // Step 1: initial load
             engine.pushChanges("line_items", ZSet.fromData(schema, allocator, new Object[][]{
                     {"Bolt", 5, 100},
                     {"Nut", 2, 250},
                     {"Washer", 1, 500},
             })).step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(3, rows.size());
                 assertEquals(1, rows.get(List.of("Bolt", 500)));
                 assertEquals(1, rows.get(List.of("Nut", 500)));
                 assertEquals(1, rows.get(List.of("Washer", 500)));
+            }
+
+            // Step 2: add a new line item
+            engine.pushChanges("line_items", ZSet.fromData(schema, allocator, new Object[][]{
+                    {"Screw", 3, 200},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("Screw", 600)));
+            }
+
+            // Step 3: update Bolt qty from 100 to 300 (delete old, insert new)
+            ZSet update;
+            try (ZSet del = ZSet.fromData(schema, allocator, new Object[][]{{"Bolt", 5, 100}})) {
+                try (ZSet neg = del.negate();
+                     ZSet ins = ZSet.fromData(schema, allocator, new Object[][]{{"Bolt", 5, 300}})) {
+                    update = neg.add(ins);
+                }
+            }
+            engine.pushChanges("line_items", update).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(2, rows.size());
+                assertEquals(-1, rows.get(List.of("Bolt", 500)));
+                assertEquals(1, rows.get(List.of("Bolt", 1500)));
             }
         }
     }
@@ -737,6 +912,7 @@ class DemoTest {
                        "UNION ALL " +
                        "SELECT origin, reading FROM stream_b WHERE reading > 10");
 
+            // Step 1: initial readings from both streams
             engine.pushChanges("stream_a", ZSet.fromData(schema, allocator, new Object[][]{
                     {1, "sensor_1", 15}, {2, "sensor_1", 5},
             }));
@@ -745,12 +921,43 @@ class DemoTest {
             }));
             engine.step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(2, rows.size());
                 assertEquals(1, rows.get(List.of("sensor_1", 15)));
                 assertEquals(1, rows.get(List.of("sensor_2", 25)));
+            }
+
+            // Step 2: new high reading from stream_a only
+            engine.pushChanges("stream_a", ZSet.fromData(schema, allocator, new Object[][]{
+                    {5, "sensor_1", 42},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("sensor_1", 42)));
+            }
+
+            // Step 3: delete a qualifying reading from stream_b, add new one to stream_b
+            ZSet bDel;
+            try (ZSet src = ZSet.fromData(schema, allocator, new Object[][]{{3, "sensor_2", 25}})) {
+                bDel = src.negate();
+            }
+            try (ZSet bIns = ZSet.fromData(schema, allocator, new Object[][]{{6, "sensor_3", 99}})) {
+                ZSet combined = bDel.add(bIns);
+                bDel.close();
+                engine.pushChanges("stream_b", combined).step();
+            }
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(2, rows.size());
+                assertEquals(-1, rows.get(List.of("sensor_2", 25)));
+                assertEquals(1, rows.get(List.of("sensor_3", 99)));
             }
         }
     }
@@ -769,6 +976,7 @@ class DemoTest {
                   .sql("SELECT region, MIN(temp) as min_temp, MAX(temp) as max_temp, COUNT(*) as readings " +
                        "FROM readings GROUP BY region");
 
+            // Step 1: initial readings
             engine.pushChanges("readings", ZSet.fromData(schema, allocator, new Object[][]{
                     {1, "North", 32},
                     {2, "North", 28},
@@ -777,12 +985,39 @@ class DemoTest {
                     {5, "South", 85},
             })).step();
 
-            try (ZSet delta = engine.getOutput()) {
-                delta.compact();
-                Map<List<Object>, Integer> rows = toMap(delta);
+            try (ZSet delta1 = engine.getOutput()) {
+                delta1.compact();
+                Map<List<Object>, Integer> rows = toMap(delta1);
                 assertEquals(2, rows.size());
                 assertEquals(1, rows.get(List.of("North", 28, 35, 3L)));
                 assertEquals(1, rows.get(List.of("South", 72, 85, 2L)));
+            }
+
+            // Step 2: new extreme reading in North — updates MIN and MAX
+            engine.pushChanges("readings", ZSet.fromData(schema, allocator, new Object[][]{
+                    {6, "North", 20},
+                    {7, "North", 40},
+            })).step();
+
+            try (ZSet delta2 = engine.getOutput()) {
+                delta2.compact();
+                Map<List<Object>, Integer> rows = toMap(delta2);
+                assertEquals(2, rows.size());
+                assertEquals(-1, rows.get(List.of("North", 28, 35, 3L)));
+                assertEquals(1, rows.get(List.of("North", 20, 40, 5L)));
+            }
+
+            // Step 3: add a new "West" region
+            engine.pushChanges("readings", ZSet.fromData(schema, allocator, new Object[][]{
+                    {8, "West", 55},
+                    {9, "West", 60},
+            })).step();
+
+            try (ZSet delta3 = engine.getOutput()) {
+                delta3.compact();
+                Map<List<Object>, Integer> rows = toMap(delta3);
+                assertEquals(1, rows.size());
+                assertEquals(1, rows.get(List.of("West", 55, 60, 2L)));
             }
         }
     }
