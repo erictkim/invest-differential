@@ -321,6 +321,25 @@ public final class IndexedZSet implements AutoCloseable {
     public <R, IR> IndexedZSet aggregate(AggregateDescription<R, IR> agg,
                                           Schema resultValueSchema,
                                           java.util.function.Function<R, Object[]> resultToRow) {
+        return aggregateImpl(null, agg, resultValueSchema, resultToRow);
+    }
+
+    /**
+     * Per-key aggregation for a subset of groups identified by key hash.
+     * Only processes groups whose key hash is in {@code affectedKeyHashes}.
+     * Groups with non-matching hashes are skipped entirely.
+     */
+    public <R, IR> IndexedZSet aggregateForKeys(Set<Integer> affectedKeyHashes,
+                                                 AggregateDescription<R, IR> agg,
+                                                 Schema resultValueSchema,
+                                                 java.util.function.Function<R, Object[]> resultToRow) {
+        return aggregateImpl(affectedKeyHashes, agg, resultValueSchema, resultToRow);
+    }
+
+    private <R, IR> IndexedZSet aggregateImpl(Set<Integer> affectedKeyHashes,
+                                               AggregateDescription<R, IR> agg,
+                                               Schema resultValueSchema,
+                                               java.util.function.Function<R, Object[]> resultToRow) {
         Map<Integer, List<Integer>> groups = buildKeyGroups();
 
         List<org.apache.arrow.vector.types.pojo.Field> outFields = new ArrayList<>();
@@ -341,9 +360,10 @@ public final class IndexedZSet implements AutoCloseable {
         int thisWeightCol = this.data.getFieldVectors().size() - 1;
         int outRow = 0;
 
-        // Process groups: we need to deduplicate by actual key equality
-        Set<Integer> processedRows = new HashSet<>();
         for (Map.Entry<Integer, List<Integer>> entry : groups.entrySet()) {
+            // Skip groups not in the affected set (when filtering)
+            if (affectedKeyHashes != null && !affectedKeyHashes.contains(entry.getKey())) continue;
+
             List<Integer> rows = entry.getValue();
             // Sub-group by actual key equality (handle hash collisions)
             List<List<Integer>> subGroups = subGroupByKey(rows);
