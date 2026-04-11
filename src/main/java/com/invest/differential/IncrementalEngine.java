@@ -208,6 +208,30 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Get the full materialized snapshot of the view — the accumulated result of all
+     * output deltas across all steps, compacted to remove zero-weight entries.
+     *
+     * <p>The returned ZSet is a copy; the caller must close it when done.
+     */
+    public ZSet getSnapshot() {
+        return getSnapshot(0);
+    }
+
+    /**
+     * Get the full materialized snapshot from a specific output index.
+     */
+    public ZSet getSnapshot(int index) {
+        ensureCompiled();
+        List<OutputOperator> outputs = circuit.getOutputs();
+        if (index >= outputs.size()) {
+            throw new IndexOutOfBoundsException("Output index " + index + " out of range (size=" + outputs.size() + ")");
+        }
+        ZSet snapshot = outputs.get(index).getSnapshot();
+        return ZSet.fromRoot(snapshot.dataSchema(),
+                ArrowUtils.cloneRoot(snapshot.data(), allocator), allocator);
+    }
+
+    /**
      * Reset all operator state.
      */
     public IncrementalEngine reset() {

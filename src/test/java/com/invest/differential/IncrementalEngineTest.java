@@ -144,4 +144,136 @@ class IncrementalEngineTest {
             assertEquals(1, r.rowCount());
         }
     }
+
+    @Test
+    void snapshotAccumulatesAcrossSteps() {
+        Schema schema = new Schema(List.of(
+                new Field("product", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("amount", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("orders", schema)
+                    .sql("SELECT product, amount FROM orders WHERE amount > 100");
+
+            // Step 1: insert 3 rows, 2 pass filter
+            ZSet delta1 = ZSet.fromData(schema, allocator, new Object[][]{
+                    {"widget", 50}, {"gadget", 150}, {"thing", 200}
+            });
+            engine.pushChanges("orders", delta1).step();
+
+            try (ZSet snap1 = engine.getSnapshot()) {
+                snap1.compact();
+                assertEquals(2, snap1.rowCount());
+            }
+
+            // Step 2: insert 1 more passing row
+            ZSet delta2 = ZSet.fromData(schema, allocator, new Object[][]{
+                    {"laptop", 999}
+            });
+            engine.pushChanges("orders", delta2).step();
+
+            try (ZSet snap2 = engine.getSnapshot()) {
+                snap2.compact();
+                assertEquals(3, snap2.rowCount()); // gadget + thing + laptop
+            }
+
+            // Step 3: delete one row via negative weight
+            ZSet delta3 = ZSet.fromData(schema, allocator, new Object[][]{
+                    {"gadget", 150}
+            }).negate();
+            engine.pushChanges("orders", delta3).step();
+
+            try (ZSet snap3 = engine.getSnapshot()) {
+                snap3.compact();
+                assertEquals(2, snap3.rowCount()); // thing + laptop
+            }
+        }
+    }
+
+    @Test
+    void snapshotWithAggregation() {
+        Schema schema = new Schema(List.of(
+                new Field("product", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("revenue", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("sales", schema)
+                    .sql("SELECT product, SUM(revenue) as total FROM sales GROUP BY product");
+
+            // Step 1: two products
+            ZSet delta1 = ZSet.fromData(schema, allocator, new Object[][]{
+                    {"A", 100}, {"B", 200}, {"A", 50}
+            });
+            engine.pushChanges("sales", delta1).step();
+
+            try (ZSet snap1 = engine.getSnapshot()) {
+                snap1.compact();
+                assertEquals(2, snap1.rowCount()); // A: 150, B: 200
+            }
+
+            // Step 2: more A sales
+            ZSet delta2 = ZSet.fromData(schema, allocator, new Object[][]{
+                    {"A", 75}
+            });
+            engine.pushChanges("sales", delta2).step();
+
+            try (ZSet snap2 = engine.getSnapshot()) {
+                snap2.compact();
+                assertEquals(2, snap2.rowCount()); // A: 225, B: 200
+            }
+        }
+    }
+
+    @Test
+    void snapshotResetsWithEngine() {
+        Schema schema = new Schema(List.of(
+                new Field("v", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("t", schema)
+                    .sql("SELECT v FROM t WHERE v > 0");
+
+            ZSet delta = ZSet.fromData(schema, allocator, new Object[][]{{1}, {2}});
+            engine.pushChanges("t", delta).step();
+
+            try (ZSet snap = engine.getSnapshot()) {
+                assertEquals(2, snap.rowCount());
+            }
+
+            engine.reset();
+
+            // After reset, snapshot should be empty
+            try (ZSet snapAfterReset = engine.getSnapshot()) {
+                assertTrue(snapAfterReset.isEmpty());
+            }
+
+            // New data after reset
+            ZSet delta2 = ZSet.fromData(schema, allocator, new Object[][]{{3}});
+            engine.pushChanges("t", delta2).step();
+
+            try (ZSet snapAfterNewData = engine.getSnapshot()) {
+                snapAfterNewData.compact();
+                assertEquals(1, snapAfterNewData.rowCount());
+            }
+        }
+    }
+
+    @Test
+    void snapshotEmptyBeforeAnyStep() {
+        Schema schema = new Schema(List.of(
+                new Field("v", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("t", schema)
+                    .sql("SELECT v FROM t");
+
+            try (ZSet snap = engine.getSnapshot()) {
+                assertTrue(snap.isEmpty());
+            }
+        }
+    }
 }
