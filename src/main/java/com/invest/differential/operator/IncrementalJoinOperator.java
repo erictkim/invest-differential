@@ -3,6 +3,7 @@ package com.invest.differential.operator;
 import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.zset.IndexedZSet;
 import com.invest.differential.zset.RowCombiner;
+import com.invest.differential.zset.RowMapper;
 import com.invest.differential.zset.ZSet;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -10,12 +11,15 @@ import org.apache.arrow.vector.types.pojo.Schema;
 /**
  * Incremental equi-join operator.
  *
- * Maintains integrated state for both inputs: I(Left), I(Right).
+ * <p>For INNER joins, maintains integrated state for both inputs: I(Left), I(Right).
  * On each step with deltas ΔLeft, ΔRight:
  *   ΔResult = (ΔLeft ⋈ I_prev(Right)) + (I_new(Left) ⋈ ΔRight)
  * where I_new(Left) = I_prev(Left) + ΔLeft.
- *
  * This avoids the double-counting term ΔLeft ⋈ ΔRight because I_new(Left) includes ΔLeft.
+ *
+ * <p>For LEFT, RIGHT, and FULL outer joins, uses an integrate-diff approach:
+ * maintains full state and previous output, recomputes the full join on the
+ * accumulated state, and diffs against the previous output to produce ΔResult.
  */
 public final class IncrementalJoinOperator implements Operator {
 
@@ -30,14 +34,26 @@ public final class IncrementalJoinOperator implements Operator {
     private final Schema outputDataSchema;
     private final RowCombiner valueCombiner;
     private final JoinType joinType;
+    private final RowMapper unmatchedLeftMapper;   // produces output for unmatched left rows (LEFT/FULL)
+    private final RowMapper unmatchedRightMapper;  // produces output for unmatched right rows (RIGHT/FULL)
 
     private ZSet leftState;   // I(Left): accumulated left deltas
     private ZSet rightState;  // I(Right): accumulated right deltas
+    private ZSet previousOutput; // previous full join output (used for outer joins)
 
     public IncrementalJoinOperator(Stream leftInput, Stream rightInput,
                                     int[] leftKeyColumns, int[] rightKeyColumns,
                                     Schema outputDataSchema, RowCombiner valueCombiner,
                                     JoinType joinType, BufferAllocator allocator) {
+        this(leftInput, rightInput, leftKeyColumns, rightKeyColumns,
+                outputDataSchema, valueCombiner, joinType, allocator, null, null);
+    }
+
+    public IncrementalJoinOperator(Stream leftInput, Stream rightInput,
+                                    int[] leftKeyColumns, int[] rightKeyColumns,
+                                    Schema outputDataSchema, RowCombiner valueCombiner,
+                                    JoinType joinType, BufferAllocator allocator,
+                                    RowMapper unmatchedLeftMapper, RowMapper unmatchedRightMapper) {
         this.leftInput = leftInput;
         this.rightInput = rightInput;
         this.output = new Stream(outputDataSchema);
@@ -49,6 +65,33 @@ public final class IncrementalJoinOperator implements Operator {
         this.joinType = joinType;
         this.leftState = ZSet.empty(leftInput.dataSchema(), allocator);
         this.rightState = ZSet.empty(rightInput.dataSchema(), allocator);
+
+        // Build default mappers if not provided
+        int leftCols = leftInput.dataSchema().getFields().size();
+        int totalCols = outputDataSchema.getFields().size();
+        this.unmatchedLeftMapper = unmatchedLeftMapper != null ? unmatchedLeftMapper : (data, row) -> {
+            Object[] vals = new Object[totalCols];
+            for (int i = 0; i < leftCols && i < totalCols; i++) {
+                vals[i] = ArrowUtils.getValue(data.getVector(i), row);
+            }
+            return vals;
+        };
+        this.unmatchedRightMapper = unmatchedRightMapper != null ? unmatchedRightMapper : (data, row) -> {
+            int rightCols = data.getFieldVectors().size() - 1; // exclude weight
+            Object[] vals = new Object[totalCols];
+            int offset = totalCols - rightCols;
+            for (int i = 0; i < rightCols && (offset + i) < totalCols; i++) {
+                vals[offset + i] = ArrowUtils.getValue(data.getVector(i), row);
+            }
+            return vals;
+        };
+
+        if (joinType == JoinType.RIGHT || joinType == JoinType.FULL
+                || joinType == JoinType.LEFT) {
+            this.previousOutput = ZSet.empty(outputDataSchema, allocator);
+        } else {
+            this.previousOutput = null;
+        }
     }
 
     @Override
@@ -56,8 +99,20 @@ public final class IncrementalJoinOperator implements Operator {
         ZSet deltaLeft = leftInput.getValue();
         ZSet deltaRight = rightInput.getValue();
 
+        if (joinType == JoinType.INNER) {
+            stepInner(deltaLeft, deltaRight);
+        } else {
+            stepOuter(deltaLeft, deltaRight);
+        }
+    }
+
+    /**
+     * Inner join: bilinear incremental formula.
+     * ΔResult = (ΔLeft ⋈ I_prev(Right)) + (I_new(Left) ⋈ ΔRight)
+     */
+    private void stepInner(ZSet deltaLeft, ZSet deltaRight) {
         // Part 1: ΔLeft ⋈ I_prev(Right)
-        ZSet part1 = joinZSets(deltaLeft, rightState);
+        ZSet part1 = innerJoinZSets(deltaLeft, rightState);
 
         // Update left state: I_new(Left) = I_prev(Left) + ΔLeft
         ZSet newLeftState = leftState.add(deltaLeft);
@@ -66,9 +121,9 @@ public final class IncrementalJoinOperator implements Operator {
         leftState = newLeftState;
 
         // Part 2: I_new(Left) ⋈ ΔRight
-        ZSet part2 = joinZSets(leftState, deltaRight);
+        ZSet part2 = innerJoinZSets(leftState, deltaRight);
 
-        // Update right state: I_new(Right) = I_prev(Right) + ΔRight
+        // Update right state
         ZSet newRightState = rightState.add(deltaRight);
         newRightState.compact();
         rightState.close();
@@ -83,29 +138,79 @@ public final class IncrementalJoinOperator implements Operator {
         output.setValue(result);
     }
 
-    private ZSet joinZSets(ZSet left, ZSet right) {
+    /**
+     * Outer joins (LEFT, RIGHT, FULL): integrate-diff approach.
+     * Accumulate state, recompute full join, diff with previous output.
+     */
+    private void stepOuter(ZSet deltaLeft, ZSet deltaRight) {
+        // Update states
+        ZSet newLeftState = leftState.add(deltaLeft);
+        newLeftState.compact();
+        leftState.close();
+        leftState = newLeftState;
+
+        ZSet newRightState = rightState.add(deltaRight);
+        newRightState.compact();
+        rightState.close();
+        rightState = newRightState;
+
+        // Compute full join on current state
+        ZSet fullOutput = outerJoinZSets(leftState, rightState);
+        fullOutput.compact();
+
+        // Diff: ΔOutput = fullOutput - previousOutput
+        ZSet deltaOutput = fullOutput.subtract(previousOutput);
+        deltaOutput.compact();
+        previousOutput.close();
+        previousOutput = fullOutput;
+
+        output.setValue(deltaOutput);
+    }
+
+    private ZSet innerJoinZSets(ZSet left, ZSet right) {
         if (left.isEmpty() || right.isEmpty()) {
             return ZSet.empty(outputDataSchema, allocator);
         }
         IndexedZSet leftIdx = left.index(leftKeyColumns);
         IndexedZSet rightIdx = right.index(rightKeyColumns);
 
-        // Build the value combiner that maps from indexed (key+value) rows
-        Schema leftValSchema = leftIdx.valueSchema();
-        Schema rightValSchema = rightIdx.valueSchema();
+        IndexedZSet joined = leftIdx.join(rightIdx, outputDataSchema, valueCombiner);
+
+        ZSet result = joined.deindex();
+        leftIdx.close();
+        rightIdx.close();
+        joined.close();
+        return result;
+    }
+
+    private ZSet outerJoinZSets(ZSet left, ZSet right) {
+        if (left.isEmpty() && right.isEmpty()) {
+            return ZSet.empty(outputDataSchema, allocator);
+        }
+        // Handle empty sides for outer joins
+        if (left.isEmpty() && joinType == JoinType.LEFT) {
+            return ZSet.empty(outputDataSchema, allocator);
+        }
+        if (right.isEmpty() && joinType == JoinType.RIGHT) {
+            return ZSet.empty(outputDataSchema, allocator);
+        }
+
+        IndexedZSet leftIdx = left.index(leftKeyColumns);
+        IndexedZSet rightIdx = right.index(rightKeyColumns);
 
         IndexedZSet joined;
         switch (joinType) {
-            case INNER:
-                joined = leftIdx.join(rightIdx, outputDataSchema, valueCombiner);
-                break;
             case LEFT:
-                Object[] nullRight = new Object[outputDataSchema.getFields().size()];
-                joined = leftIdx.leftJoin(rightIdx, outputDataSchema, valueCombiner, nullRight);
+                joined = leftIdx.leftJoin(rightIdx, outputDataSchema, valueCombiner, unmatchedLeftMapper);
+                break;
+            case RIGHT:
+                joined = leftIdx.rightJoin(rightIdx, outputDataSchema, valueCombiner, unmatchedRightMapper);
+                break;
+            case FULL:
+                joined = leftIdx.fullJoin(rightIdx, outputDataSchema, valueCombiner,
+                        unmatchedLeftMapper, unmatchedRightMapper);
                 break;
             default:
-                // For RIGHT join, swap sides and adjust combiner
-                // For FULL, implement as LEFT ∪ anti-join(RIGHT)
                 joined = leftIdx.join(rightIdx, outputDataSchema, valueCombiner);
                 break;
         }
@@ -121,8 +226,12 @@ public final class IncrementalJoinOperator implements Operator {
     public void reset() {
         if (leftState != null) leftState.close();
         if (rightState != null) rightState.close();
+        if (previousOutput != null) previousOutput.close();
         leftState = ZSet.empty(leftInput.dataSchema(), allocator);
         rightState = ZSet.empty(rightInput.dataSchema(), allocator);
+        if (joinType != JoinType.INNER) {
+            previousOutput = ZSet.empty(outputDataSchema, allocator);
+        }
         output.clear();
     }
 
@@ -130,6 +239,7 @@ public final class IncrementalJoinOperator implements Operator {
     public void close() {
         if (leftState != null) { leftState.close(); leftState = null; }
         if (rightState != null) { rightState.close(); rightState = null; }
+        if (previousOutput != null) { previousOutput.close(); previousOutput = null; }
         output.clear();
     }
 

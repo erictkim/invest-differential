@@ -238,10 +238,11 @@ public final class IndexedZSet implements AutoCloseable {
     }
 
     /**
-     * Left outer join: matched rows + unmatched left rows with null right values.
+     * Left outer join: matched rows + unmatched left rows.
+     * For unmatched left rows, {@code unmatchedLeftMapper} produces the output value columns.
      */
     public IndexedZSet leftJoin(IndexedZSet other, Schema outputValueSchema,
-                                 RowCombiner valueCombiner, Object[] nullRightValues) {
+                                 RowCombiner valueCombiner, RowMapper unmatchedLeftMapper) {
         Map<Integer, List<Integer>> leftGroups = buildKeyGroups();
         Map<Integer, List<Integer>> rightGroups = other.buildKeyGroups();
 
@@ -298,12 +299,199 @@ public final class IndexedZSet implements AutoCloseable {
                         ArrowUtils.setValue(result.getVector(i), outRow,
                                 ArrowUtils.getValue(this.data.getVector(keyColumnIndices[i]), leftRow));
                     }
-                    for (int i = 0; i < nullRightValues.length; i++) {
-                        ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, nullRightValues[i]);
+                    Object[] unmatchedVals = unmatchedLeftMapper.map(this.data, leftRow);
+                    for (int i = 0; i < unmatchedVals.length; i++) {
+                        ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, unmatchedVals[i]);
                     }
                     ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, w1);
                     outRow++;
                 }
+            }
+        }
+        result.setRowCount(outRow);
+
+        int[] outHashes = computeKeyHashes(result, outKeyIndices);
+        return new IndexedZSet(allocator, keySchema, outputValueSchema, outKeyIndices, outValueIndices,
+                outFull, result, outHashes);
+    }
+
+    /**
+     * Right outer join: matched rows + unmatched right rows.
+     * For unmatched right rows, {@code unmatchedRightMapper} produces the output value columns.
+     */
+    public IndexedZSet rightJoin(IndexedZSet other, Schema outputValueSchema,
+                                  RowCombiner valueCombiner, RowMapper unmatchedRightMapper) {
+        Map<Integer, List<Integer>> leftGroups = buildKeyGroups();
+        Map<Integer, List<Integer>> rightGroups = other.buildKeyGroups();
+
+        List<org.apache.arrow.vector.types.pojo.Field> outFields = new ArrayList<>();
+        outFields.addAll(keySchema.getFields());
+        outFields.addAll(outputValueSchema.getFields());
+        outFields.add(new org.apache.arrow.vector.types.pojo.Field(ArrowUtils.WEIGHT_COLUMN,
+                org.apache.arrow.vector.types.pojo.FieldType.notNullable(
+                        new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)), null));
+        Schema outFull = new Schema(outFields);
+        int[] outKeyIndices = new int[keyColumnIndices.length];
+        for (int i = 0; i < outKeyIndices.length; i++) outKeyIndices[i] = i;
+        int[] outValueIndices = new int[outputValueSchema.getFields().size()];
+        for (int i = 0; i < outValueIndices.length; i++) outValueIndices[i] = keyColumnIndices.length + i;
+
+        VectorSchemaRoot result = VectorSchemaRoot.create(outFull, allocator);
+        result.allocateNew();
+        int outWeightCol = outFields.size() - 1;
+        int thisWeightCol = this.data.getFieldVectors().size() - 1;
+        int otherWeightCol = other.data.getFieldVectors().size() - 1;
+        int outRow = 0;
+
+        Set<Integer> matchedRightRows = new HashSet<>();
+
+        for (Map.Entry<Integer, List<Integer>> leftEntry : leftGroups.entrySet()) {
+            List<Integer> rightRows = rightGroups.get(leftEntry.getKey());
+            if (rightRows == null) continue;
+
+            for (int leftRow : leftEntry.getValue()) {
+                for (int rightRow : rightRows) {
+                    if (!RowHasher.rowsEqual(this.data, leftRow, other.data, rightRow, keyColumnIndices)) {
+                        continue;
+                    }
+                    matchedRightRows.add(rightRow);
+
+                    int w1 = ((IntVector) this.data.getVector(thisWeightCol)).get(leftRow);
+                    int w2 = ((IntVector) other.data.getVector(otherWeightCol)).get(rightRow);
+                    int wOut = Math.multiplyExact(w1, w2);
+                    if (wOut == 0) continue;
+
+                    for (int i = 0; i < keyColumnIndices.length; i++) {
+                        ArrowUtils.setValue(result.getVector(i), outRow,
+                                ArrowUtils.getValue(this.data.getVector(keyColumnIndices[i]), leftRow));
+                    }
+                    Object[] vals = valueCombiner.combine(this.data, leftRow, other.data, rightRow);
+                    for (int i = 0; i < vals.length; i++) {
+                        ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, vals[i]);
+                    }
+                    ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, wOut);
+                    outRow++;
+                }
+            }
+        }
+
+        for (List<Integer> rightRows : rightGroups.values()) {
+            for (int rightRow : rightRows) {
+                if (matchedRightRows.contains(rightRow)) continue;
+                int w2 = ((IntVector) other.data.getVector(otherWeightCol)).get(rightRow);
+
+                for (int i = 0; i < keyColumnIndices.length; i++) {
+                    ArrowUtils.setValue(result.getVector(i), outRow,
+                            ArrowUtils.getValue(other.data.getVector(other.keyColumnIndices[i]), rightRow));
+                }
+                Object[] unmatchedVals = unmatchedRightMapper.map(other.data, rightRow);
+                for (int i = 0; i < unmatchedVals.length; i++) {
+                    ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, unmatchedVals[i]);
+                }
+                ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, w2);
+                outRow++;
+            }
+        }
+        result.setRowCount(outRow);
+
+        int[] outHashes = computeKeyHashes(result, outKeyIndices);
+        return new IndexedZSet(allocator, keySchema, outputValueSchema, outKeyIndices, outValueIndices,
+                outFull, result, outHashes);
+    }
+
+    /**
+     * Full outer join: matched rows + unmatched left rows + unmatched right rows.
+     * {@code unmatchedLeftMapper} produces output columns for unmatched left rows.
+     * {@code unmatchedRightMapper} produces output columns for unmatched right rows.
+     */
+    public IndexedZSet fullJoin(IndexedZSet other, Schema outputValueSchema,
+                                 RowCombiner valueCombiner,
+                                 RowMapper unmatchedLeftMapper, RowMapper unmatchedRightMapper) {
+        Map<Integer, List<Integer>> leftGroups = buildKeyGroups();
+        Map<Integer, List<Integer>> rightGroups = other.buildKeyGroups();
+
+        List<org.apache.arrow.vector.types.pojo.Field> outFields = new ArrayList<>();
+        outFields.addAll(keySchema.getFields());
+        outFields.addAll(outputValueSchema.getFields());
+        outFields.add(new org.apache.arrow.vector.types.pojo.Field(ArrowUtils.WEIGHT_COLUMN,
+                org.apache.arrow.vector.types.pojo.FieldType.notNullable(
+                        new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)), null));
+        Schema outFull = new Schema(outFields);
+        int[] outKeyIndices = new int[keyColumnIndices.length];
+        for (int i = 0; i < outKeyIndices.length; i++) outKeyIndices[i] = i;
+        int[] outValueIndices = new int[outputValueSchema.getFields().size()];
+        for (int i = 0; i < outValueIndices.length; i++) outValueIndices[i] = keyColumnIndices.length + i;
+
+        VectorSchemaRoot result = VectorSchemaRoot.create(outFull, allocator);
+        result.allocateNew();
+        int outWeightCol = outFields.size() - 1;
+        int thisWeightCol = this.data.getFieldVectors().size() - 1;
+        int otherWeightCol = other.data.getFieldVectors().size() - 1;
+        int outRow = 0;
+
+        Set<Integer> matchedRightRows = new HashSet<>();
+
+        for (Map.Entry<Integer, List<Integer>> leftEntry : leftGroups.entrySet()) {
+            List<Integer> rightRows = rightGroups.get(leftEntry.getKey());
+
+            for (int leftRow : leftEntry.getValue()) {
+                boolean matched = false;
+                if (rightRows != null) {
+                    for (int rightRow : rightRows) {
+                        if (!RowHasher.rowsEqual(this.data, leftRow, other.data, rightRow, keyColumnIndices)) {
+                            continue;
+                        }
+                        matched = true;
+                        matchedRightRows.add(rightRow);
+
+                        int w1 = ((IntVector) this.data.getVector(thisWeightCol)).get(leftRow);
+                        int w2 = ((IntVector) other.data.getVector(otherWeightCol)).get(rightRow);
+                        int wOut = Math.multiplyExact(w1, w2);
+                        if (wOut == 0) continue;
+
+                        for (int i = 0; i < keyColumnIndices.length; i++) {
+                            ArrowUtils.setValue(result.getVector(i), outRow,
+                                    ArrowUtils.getValue(this.data.getVector(keyColumnIndices[i]), leftRow));
+                        }
+                        Object[] vals = valueCombiner.combine(this.data, leftRow, other.data, rightRow);
+                        for (int i = 0; i < vals.length; i++) {
+                            ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, vals[i]);
+                        }
+                        ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, wOut);
+                        outRow++;
+                    }
+                }
+                if (!matched) {
+                    int w1 = ((IntVector) this.data.getVector(thisWeightCol)).get(leftRow);
+                    for (int i = 0; i < keyColumnIndices.length; i++) {
+                        ArrowUtils.setValue(result.getVector(i), outRow,
+                                ArrowUtils.getValue(this.data.getVector(keyColumnIndices[i]), leftRow));
+                    }
+                    Object[] unmatchedVals = unmatchedLeftMapper.map(this.data, leftRow);
+                    for (int i = 0; i < unmatchedVals.length; i++) {
+                        ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, unmatchedVals[i]);
+                    }
+                    ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, w1);
+                    outRow++;
+                }
+            }
+        }
+
+        for (List<Integer> rightRows : rightGroups.values()) {
+            for (int rightRow : rightRows) {
+                if (matchedRightRows.contains(rightRow)) continue;
+                int w2 = ((IntVector) other.data.getVector(otherWeightCol)).get(rightRow);
+
+                for (int i = 0; i < keyColumnIndices.length; i++) {
+                    ArrowUtils.setValue(result.getVector(i), outRow,
+                            ArrowUtils.getValue(other.data.getVector(other.keyColumnIndices[i]), rightRow));
+                }
+                Object[] unmatchedVals = unmatchedRightMapper.map(other.data, rightRow);
+                for (int i = 0; i < unmatchedVals.length; i++) {
+                    ArrowUtils.setValue(result.getVector(keyColumnIndices.length + i), outRow, unmatchedVals[i]);
+                }
+                ((IntVector) result.getVector(outWeightCol)).setSafe(outRow, w2);
+                outRow++;
             }
         }
         result.setRowCount(outRow);

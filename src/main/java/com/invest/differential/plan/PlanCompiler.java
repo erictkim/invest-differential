@@ -7,6 +7,7 @@ import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.AggregateDescription;
 import com.invest.differential.zset.RowCombiner;
 import com.invest.differential.zset.RowMapper;
+import com.invest.differential.zset.RowMapper;
 import com.invest.differential.zset.RowPredicate;
 import io.substrait.expression.AggregateFunctionInvocation;
 import io.substrait.expression.Expression;
@@ -686,9 +687,47 @@ public final class PlanCompiler {
             adjustedRightKeys[i] = rightKeyCols[i] - leftColCount;
         }
 
+        // Build RowMappers for unmatched rows in outer joins
+        RowMapper unmatchedLeftMapper = null;
+        RowMapper unmatchedRightMapper = null;
+        if (joinType != IncrementalJoinOperator.JoinType.INNER) {
+            int leftV = leftSchema.getFields().size();
+            int rightV = rightSchema.getFields().size();
+            int totalRaw = leftV + rightV;
+            unmatchedLeftMapper = (data, row) -> {
+                Object[] allValues = new Object[totalRaw];
+                for (int i = 0; i < leftV; i++) {
+                    allValues[i] = ArrowUtils.getValue(data.getVector(i), row);
+                }
+                if (finalEmitIndices != null) {
+                    Object[] emitted = new Object[finalEmitIndices.length];
+                    for (int i = 0; i < finalEmitIndices.length; i++) {
+                        emitted[i] = allValues[finalEmitIndices[i]];
+                    }
+                    return emitted;
+                }
+                return allValues;
+            };
+            unmatchedRightMapper = (data, row) -> {
+                Object[] allValues = new Object[totalRaw];
+                for (int i = 0; i < rightV; i++) {
+                    allValues[leftV + i] = ArrowUtils.getValue(data.getVector(i), row);
+                }
+                if (finalEmitIndices != null) {
+                    Object[] emitted = new Object[finalEmitIndices.length];
+                    for (int i = 0; i < finalEmitIndices.length; i++) {
+                        emitted[i] = allValues[finalEmitIndices[i]];
+                    }
+                    return emitted;
+                }
+                return allValues;
+            };
+        }
+
         IncrementalJoinOperator joinOp = new IncrementalJoinOperator(
                 leftInput, rightInput, leftKeyCols, adjustedRightKeys,
-                outputDataSchema, valueCombiner, joinType, allocator);
+                outputDataSchema, valueCombiner, joinType, allocator,
+                unmatchedLeftMapper, unmatchedRightMapper);
         circuit.addOperator(joinOp);
         return joinOp.getOutput();
     }

@@ -359,4 +359,145 @@ class CircuitTest {
         result.compact();
         assertEquals(1, result.rowCount()); // Only {3}, not {1,2,3}
     }
+
+    // ---- Helper for outer join tests ----
+
+    private Schema joinLeftSchema() {
+        return new Schema(List.of(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)
+        ));
+    }
+
+    private Schema joinRightSchema() {
+        return new Schema(List.of(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("amount", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+    }
+
+    private Schema joinOutputSchema() {
+        return new Schema(List.of(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("name", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("id2", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("amount", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+    }
+
+    private RowCombiner joinCombiner() {
+        return (left, lr, right, rr) -> new Object[]{
+                ArrowUtils.getValue(left.getVector(0), lr),
+                ArrowUtils.getValue(left.getVector(1), lr),
+                ArrowUtils.getValue(right.getVector(0), rr),
+                ArrowUtils.getValue(right.getVector(1), rr)
+        };
+    }
+
+    @Test
+    void incrementalJoinRight() {
+        Schema leftSchema = joinLeftSchema();
+        Schema rightSchema = joinRightSchema();
+        Schema outputSchema = joinOutputSchema();
+
+        Circuit circuit = new Circuit();
+        InputOperator leftInput = new InputOperator("left", leftSchema, allocator);
+        InputOperator rightInput = new InputOperator("right", rightSchema, allocator);
+        circuit.addOperator(leftInput);
+        circuit.addOperator(rightInput);
+
+        IncrementalJoinOperator join = new IncrementalJoinOperator(
+                leftInput.getOutput(), rightInput.getOutput(),
+                new int[]{0}, new int[]{0},
+                outputSchema, joinCombiner(),
+                IncrementalJoinOperator.JoinType.RIGHT, allocator);
+        circuit.addOperator(join);
+
+        OutputOperator output = new OutputOperator("result", join.getOutput(), allocator);
+        circuit.addOperator(output);
+
+        // Step 1: left={1,"alice"}, right={1,100},{2,200}
+        // id=1 matches, id=2 unmatched → appears with null left
+        leftInput.setValue(ZSet.fromData(leftSchema, allocator, new Object[][]{{1, "alice"}}));
+        rightInput.setValue(ZSet.fromData(rightSchema, allocator, new Object[][]{{1, 100}, {2, 200}}));
+        circuit.step();
+
+        ZSet result1 = output.getValue();
+        result1.compact();
+        assertEquals(2, result1.rowCount()); // matched id=1 + unmatched id=2
+
+        // Step 2: add left={2,"bob"} → id=2 now matched
+        // delta should retract the null-left row and add the matched row
+        leftInput.setValue(ZSet.fromData(leftSchema, allocator, new Object[][]{{2, "bob"}}));
+        rightInput.setValue(ZSet.empty(rightSchema, allocator));
+        circuit.step();
+
+        ZSet result2 = output.getValue();
+        result2.compact();
+        assertEquals(2, result2.rowCount()); // -1 for null-left row, +1 for matched row
+    }
+
+    @Test
+    void incrementalJoinFull() {
+        Schema leftSchema = joinLeftSchema();
+        Schema rightSchema = joinRightSchema();
+        Schema outputSchema = joinOutputSchema();
+
+        Circuit circuit = new Circuit();
+        InputOperator leftInput = new InputOperator("left", leftSchema, allocator);
+        InputOperator rightInput = new InputOperator("right", rightSchema, allocator);
+        circuit.addOperator(leftInput);
+        circuit.addOperator(rightInput);
+
+        IncrementalJoinOperator join = new IncrementalJoinOperator(
+                leftInput.getOutput(), rightInput.getOutput(),
+                new int[]{0}, new int[]{0},
+                outputSchema, joinCombiner(),
+                IncrementalJoinOperator.JoinType.FULL, allocator);
+        circuit.addOperator(join);
+
+        OutputOperator output = new OutputOperator("result", join.getOutput(), allocator);
+        circuit.addOperator(output);
+
+        // Step 1: left={1,"alice"},{3,"charlie"}, right={1,100},{2,200}
+        // id=1 matches, id=3 unmatched left, id=2 unmatched right → 3 rows
+        leftInput.setValue(ZSet.fromData(leftSchema, allocator, new Object[][]{
+                {1, "alice"}, {3, "charlie"}}));
+        rightInput.setValue(ZSet.fromData(rightSchema, allocator, new Object[][]{
+                {1, 100}, {2, 200}}));
+        circuit.step();
+
+        ZSet result1 = output.getValue();
+        result1.compact();
+        assertEquals(3, result1.rowCount());
+
+        // Step 2: add right={3,300} → id=3 now matches
+        // delta should retract the null-right row for charlie and add matched row
+        leftInput.setValue(ZSet.empty(leftSchema, allocator));
+        rightInput.setValue(ZSet.fromData(rightSchema, allocator, new Object[][]{{3, 300}}));
+        circuit.step();
+
+        ZSet result2 = output.getValue();
+        result2.compact();
+        assertEquals(2, result2.rowCount()); // -1 for null-right, +1 for matched
+
+        // Step 3: add left={2,"bob"} → id=2 now matches from the left
+        // delta should retract the null-left row for id=2 and add the matched row
+        leftInput.setValue(ZSet.fromData(leftSchema, allocator, new Object[][]{{2, "bob"}}));
+        rightInput.setValue(ZSet.empty(rightSchema, allocator));
+        circuit.step();
+
+        ZSet result3 = output.getValue();
+        result3.compact();
+        assertEquals(2, result3.rowCount()); // -1 for null-left, +1 for matched
+
+        // Step 4: no changes → empty delta
+        leftInput.setValue(ZSet.empty(leftSchema, allocator));
+        rightInput.setValue(ZSet.empty(rightSchema, allocator));
+        circuit.step();
+
+        ZSet result4 = output.getValue();
+        result4.compact();
+        assertTrue(result4.isEmpty());
+    }
 }
