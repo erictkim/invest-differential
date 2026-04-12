@@ -5,8 +5,8 @@
 ### 1. Partial Aggregate Recomputation
 The `IncrementalAggregateOperator` recomputes all groups on every step. Track which group keys were touched by ΔInput and only recompute affected groups — significant for large cardinality GROUP BY.
 
-### 2. RIGHT and FULL OUTER Joins
-`IncrementalJoinOperator` has a `default` case that falls through to inner join for RIGHT/FULL. Implement these properly (anti-join based) to round out join support.
+### 2. ~~RIGHT and FULL OUTER Joins~~ ✅
+RIGHT and FULL OUTER joins are now fully implemented in `IncrementalJoinOperator` via integrate-diff with `unmatchedLeftMapper`/`unmatchedRightMapper`.
 
 ### 3. ~~Materialized View Snapshots~~ ✅
 `getSnapshot()` now returns the current full accumulated view for consumers that need the whole result.
@@ -36,29 +36,47 @@ Operator state (accumulated inputs in join/aggregate/window) lives only in memor
 ### 10. Timestamp-Indexed / Arrangement-Based Traces
 Move from single-timestep Z-sets to multi-timestep traces (as in Differential Dataflow), enabling out-of-order updates, late arrivals, and temporal queries.
 
-### 11. Standard String Functions
-Only `CONCAT` and custom scalar UDFs are supported. Add built-in `UPPER()`, `LOWER()`, `LENGTH()`, `SUBSTRING()`, `TRIM()`, `LTRIM()`, `RTRIM()` to `ScalarFunctionEvaluator`.
+### 11. ~~Standard String Functions~~ ✅
+`UPPER`, `LOWER`, `CHAR_LENGTH`, `SUBSTRING`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `STARTS_WITH`, `CONCAT` are all implemented in `ScalarFunctionEvaluator` and tested in `StringFunctionTest`.
 
-### 12. Date/Time Functions
-No date or timestamp arithmetic, `CURRENT_TIMESTAMP`, `DATE_TRUNC`, etc. Arrow has date/time vectors but no Substrait-to-execution mapping exists yet.
+### 12. ~~Date/Time Functions~~ ✅
+`EXTRACT` (YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/DOW/DOY), `ADD_DATE_DAYS`, `SUBTRACT_DATE_DAYS` are implemented with full date/timestamp column support. Tested in `DateTimeFunctionTest`.
 
-### 13. CASE / IF-THEN-ELSE Expressions
-`IfThenEvaluator` exists but is untested. Validate and test conditional expressions in `SELECT` and `WHERE` clauses.
+### 13. ~~CASE / IF-THEN-ELSE Expressions~~ ✅
+Simple CASE, searched CASE, and CASE without ELSE (returns NULL) are all implemented and tested in `CaseExpressionTest`.
 
-### 14. Set Operations: EXCEPT and INTERSECT
-`UNION ALL` is implemented but `EXCEPT` (difference) and `INTERSECT` are not compiled. Both are natural Z-set operations (subtract weights / min weights).
+### 14. ~~Set Operations: EXCEPT and INTERSECT~~ ✅
+`UNION ALL`, `UNION DISTINCT`, `EXCEPT`, and `INTERSECT` are all compiled via `PlanCompiler.compileSet()` and tested in `ExceptIntersectTest`.
 
-### 15. CTE (Common Table Expressions) / WITH Clauses
-`WITH name AS (SELECT ...) SELECT ... FROM name` — named intermediate views within a single query. Requires recursive plan compilation.
+### 15. ~~CTE (Common Table Expressions) / WITH Clauses~~ ✅
+Full `WITH` clause support is implemented and tested in `CteTest` with 8 test methods.
 
-### 16. Query Plan Visualization
-Export the Circuit as DOT (Graphviz) or similar format. Show operator names, stream connections, and cardinalities for debugging dataflow graphs.
+### 16. ~~Query Plan Visualization~~ ✅
+`Circuit.toDot()` exports DOT/Graphviz format with operator nodes and stream edges. Tested in `QueryPlanVisualizationTest` with 8 tests.
 
-### 17. Operator Metrics / Telemetry
-Add counters for rows processed, timers for `step()` execution, and state-size tracking (bytes in accumulated input). Expose via a `CircuitMetrics` API.
+### 17. ~~Operator Metrics / Telemetry~~ ✅
+`OperatorMetrics` tracks step count, total nanos, and rows produced per operator. `Circuit.setMetricsEnabled(true)` activates instrumentation in `step()`. Tested in `OperatorMetricsTest` with 9 tests.
 
-### 18. Vectorized Expression Evaluation
-Expressions are evaluated row-at-a-time. Batch-evaluate over Arrow columnar buffers for significant performance gains on large datasets.
+### 18. ~~Vectorized Expression Evaluation~~ ✅
+`VectorizedEvaluator` and `VectorizedExpressions` provide batch-level evaluation over Arrow columnar buffers. Supports arithmetic, comparison, boolean, and string operations with `filterBatch()` and `projectBatch()` utilities. ~13x speedup over row-at-a-time. Tested in `VectorizedExpressionTest` with 21 tests.
 
-### 19. Benchmarking Suite
-Micro-benchmarks for key operators (join, aggregate, window) and macro-benchmarks for end-to-end incremental queries to catch performance regressions.
+### 19. ~~Benchmarking Suite~~ ✅
+JUnit-based benchmarks with warmup and measured iterations. Covers filter, project, aggregate, join (inner/left), incremental steps, complex pipelines, multi-query, and vectorized comparison. Implemented in `BenchmarkTest` with 12 benchmarks.
+
+### 20. Expression Support in GROUP BY / PARTITION BY / ORDER BY
+Currently only field references are allowed in `GROUP BY`, `PARTITION BY`, and `ORDER BY` clauses. Computed expressions (e.g., `GROUP BY YEAR(date)` or `ORDER BY a + b`) throw exceptions. Support arbitrary expressions in these positions.
+
+### 21. ~~Additional Date/Time Functions~~ ✅
+`DATE_TRUNC`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `DATE_DIFF` are all implemented in `ScalarFunctionEvaluator` with full date/timestamp support. Tested in `AdditionalDateTimeFunctionTest` with 17 tests.
+
+### 22. COALESCE / NULLIF / NULL-safe Comparisons
+`COALESCE` is implemented but `NULLIF`, `NVL`, and `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` (null-safe equality) are missing.
+
+### 23. GROUPING SETS / ROLLUP / CUBE
+Multi-level aggregation hierarchies for reporting (e.g., `GROUP BY ROLLUP(region, product)`). Requires emitting multiple aggregate groupings per input.
+
+### 24. ~~Incremental Window Function Optimization~~ ✅
+`IncrementalWindowOperator` now maintains a `partitionOutputCache` and only recomputes partitions affected by deltas. Untouched partitions are served from cache, avoiding full recomputation. All 19 existing window tests pass.
+
+### 25. Schema Evolution
+No support for altering table schemas after registration. Adding/removing/renaming columns on registered tables would require recompiling dependent operators.

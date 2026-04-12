@@ -43,6 +43,10 @@ public final class SubstraitTypeMapper {
             return new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null);
         } else if (substraitType instanceof Type.TimestampTZ) {
             return new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, "UTC");
+        } else if (substraitType instanceof Type.PrecisionTimestamp pt) {
+            return new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null);
+        } else if (substraitType instanceof Type.PrecisionTimestampTZ pt) {
+            return new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, "UTC");
         } else if (substraitType instanceof Type.Decimal dec) {
             return new ArrowType.Decimal(dec.precision(), dec.scale(), 128);
         }

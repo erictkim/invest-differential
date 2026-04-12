@@ -38,6 +38,9 @@ public final class IncrementalWindowOperator implements Operator {
     private ZSet accumulatedInput;
     private ZSet previousOutput;
 
+    // Cached per-partition output keyed by partition key. Enables incremental recompute.
+    private Map<List<Object>, ZSet> partitionOutputCache;
+
     public IncrementalWindowOperator(Stream input,
                                      Schema outputDataSchema,
                                      int[] partitionColumns,
@@ -56,6 +59,7 @@ public final class IncrementalWindowOperator implements Operator {
         this.windowFunctions = windowFunctions;
         this.accumulatedInput = ZSet.empty(inputDataSchema, allocator);
         this.previousOutput = ZSet.empty(outputDataSchema, allocator);
+        this.partitionOutputCache = new LinkedHashMap<>();
     }
 
     @Override
@@ -68,13 +72,43 @@ public final class IncrementalWindowOperator implements Operator {
         accumulatedInput.close();
         accumulatedInput = newState;
 
-        // Compute full window output
-        ZSet fullOutput;
         if (accumulatedInput.isEmpty()) {
-            fullOutput = ZSet.empty(outputDataSchema, allocator);
-        } else {
-            fullOutput = computeWindowOutput(accumulatedInput);
+            // Invalidate all cached partitions
+            for (ZSet cached : partitionOutputCache.values()) cached.close();
+            partitionOutputCache.clear();
+            ZSet emptyOut = ZSet.empty(outputDataSchema, allocator);
+            ZSet deltaOutput = emptyOut.subtract(previousOutput);
+            deltaOutput.compact();
+            previousOutput.close();
+            previousOutput = emptyOut;
+            output.setValue(deltaOutput);
+            return;
         }
+
+        // Determine which partitions were touched by the delta
+        Set<List<Object>> touchedPartitions = collectPartitionKeys(delta);
+
+        // Recompute only touched partitions; reuse cached output for untouched ones
+        Map<List<Object>, List<Integer>> allPartitions = buildPartitions(accumulatedInput);
+
+        // For touched partitions, recompute; also handle partitions that disappeared
+        for (List<Object> key : touchedPartitions) {
+            ZSet old = partitionOutputCache.remove(key);
+            if (old != null) old.close();
+        }
+
+        // Recompute touched partitions from accumulated state
+        for (List<Object> key : touchedPartitions) {
+            List<Integer> rows = allPartitions.get(key);
+            if (rows != null && !rows.isEmpty()) {
+                ZSet partOut = computePartitionOutput(accumulatedInput.data(), rows);
+                partitionOutputCache.put(key, partOut);
+            }
+            // If rows == null, partition disappeared — already removed from cache above
+        }
+
+        // Build full output from cache
+        ZSet fullOutput = mergePartitionOutputs();
 
         // Diff: ΔOutput = fullOutput - previousOutput
         ZSet deltaOutput = fullOutput.subtract(previousOutput);
@@ -85,13 +119,27 @@ public final class IncrementalWindowOperator implements Operator {
         output.setValue(deltaOutput);
     }
 
-    private ZSet computeWindowOutput(ZSet inputZSet) {
+    /**
+     * Collect the set of partition keys present in a delta ZSet.
+     */
+    private Set<List<Object>> collectPartitionKeys(ZSet delta) {
+        Set<List<Object>> keys = new LinkedHashSet<>();
+        VectorSchemaRoot root = delta.data();
+        for (int r = 0; r < root.getRowCount(); r++) {
+            keys.add(getPartitionKey(root, r));
+        }
+        return keys;
+    }
+
+    /**
+     * Build partition groupings from the accumulated input.
+     * Expands rows by weight and groups by partition key.
+     */
+    private Map<List<Object>, List<Integer>> buildPartitions(ZSet inputZSet) {
         VectorSchemaRoot inputRoot = inputZSet.data();
         int rowCount = inputRoot.getRowCount();
-        int inputDataCols = inputDataSchema.getFields().size();
         int weightColIdx = inputRoot.getFieldVectors().size() - 1;
 
-        // Expand rows by weight (only positive weight rows participate)
         List<Integer> expandedRows = new ArrayList<>();
         for (int r = 0; r < rowCount; r++) {
             int weight = ((IntVector) inputRoot.getVector(weightColIdx)).get(r);
@@ -100,11 +148,6 @@ public final class IncrementalWindowOperator implements Operator {
             }
         }
 
-        if (expandedRows.isEmpty()) {
-            return ZSet.empty(outputDataSchema, allocator);
-        }
-
-        // Group by partition columns
         Map<List<Object>, List<Integer>> partitions = new LinkedHashMap<>();
         for (int idx : expandedRows) {
             List<Object> key = getPartitionKey(inputRoot, idx);
@@ -116,37 +159,51 @@ public final class IncrementalWindowOperator implements Operator {
             partition.sort((a, b) -> compareRows(inputRoot, a, b));
         }
 
-        // Compute window functions and build output
+        return partitions;
+    }
+
+    /**
+     * Compute window output for a single partition (list of sorted expanded row indices).
+     */
+    private ZSet computePartitionOutput(VectorSchemaRoot inputRoot, List<Integer> partition) {
+        int inputDataCols = inputDataSchema.getFields().size();
         Schema outFull = ArrowUtils.createSchemaWithWeight(outputDataSchema);
         VectorSchemaRoot outRoot = VectorSchemaRoot.create(outFull, allocator);
         outRoot.allocateNew();
         int outWeightCol = outRoot.getFieldVectors().size() - 1;
-        int outRow = 0;
 
-        for (List<Integer> partition : partitions.values()) {
-            for (int posInPartition = 0; posInPartition < partition.size(); posInPartition++) {
-                int srcRow = partition.get(posInPartition);
+        for (int posInPartition = 0; posInPartition < partition.size(); posInPartition++) {
+            int srcRow = partition.get(posInPartition);
 
-                // Copy input columns
-                for (int col = 0; col < inputDataCols; col++) {
-                    Object val = ArrowUtils.getValue(inputRoot.getVector(col), srcRow);
-                    ArrowUtils.setValue(outRoot.getVector(col), outRow, val);
-                }
-
-                // Compute each window function
-                for (int f = 0; f < windowFunctions.size(); f++) {
-                    WindowFunctionSpec spec = windowFunctions.get(f);
-                    Object result = computeWindowFunction(spec, inputRoot, partition, posInPartition);
-                    ArrowUtils.setValue(outRoot.getVector(inputDataCols + f), outRow, result);
-                }
-
-                ((IntVector) outRoot.getVector(outWeightCol)).setSafe(outRow, 1);
-                outRow++;
+            for (int col = 0; col < inputDataCols; col++) {
+                Object val = ArrowUtils.getValue(inputRoot.getVector(col), srcRow);
+                ArrowUtils.setValue(outRoot.getVector(col), posInPartition, val);
             }
+
+            for (int f = 0; f < windowFunctions.size(); f++) {
+                WindowFunctionSpec spec = windowFunctions.get(f);
+                Object result = computeWindowFunction(spec, inputRoot, partition, posInPartition);
+                ArrowUtils.setValue(outRoot.getVector(inputDataCols + f), posInPartition, result);
+            }
+
+            ((IntVector) outRoot.getVector(outWeightCol)).setSafe(posInPartition, 1);
         }
-        outRoot.setRowCount(outRow);
+        outRoot.setRowCount(partition.size());
 
         return ZSet.fromRoot(outputDataSchema, outRoot, allocator);
+    }
+
+    /**
+     * Merge all partition outputs from the cache into a single ZSet.
+     */
+    private ZSet mergePartitionOutputs() {
+        ZSet merged = ZSet.empty(outputDataSchema, allocator);
+        for (ZSet partOut : partitionOutputCache.values()) {
+            ZSet combined = merged.add(partOut);
+            merged.close();
+            merged = combined;
+        }
+        return merged;
     }
 
     @SuppressWarnings("unchecked")
@@ -301,6 +358,7 @@ public final class IncrementalWindowOperator implements Operator {
     public void reset() {
         if (accumulatedInput != null) accumulatedInput.close();
         if (previousOutput != null) previousOutput.close();
+        clearPartitionCache();
         accumulatedInput = ZSet.empty(inputDataSchema, allocator);
         previousOutput = ZSet.empty(outputDataSchema, allocator);
         output.clear();
@@ -310,7 +368,15 @@ public final class IncrementalWindowOperator implements Operator {
     public void close() {
         if (accumulatedInput != null) { accumulatedInput.close(); accumulatedInput = null; }
         if (previousOutput != null) { previousOutput.close(); previousOutput = null; }
+        clearPartitionCache();
         output.clear();
+    }
+
+    private void clearPartitionCache() {
+        if (partitionOutputCache != null) {
+            for (ZSet cached : partitionOutputCache.values()) cached.close();
+            partitionOutputCache.clear();
+        }
     }
 
     @Override

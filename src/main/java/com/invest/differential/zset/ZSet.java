@@ -381,7 +381,14 @@ public final class ZSet implements AutoCloseable {
     }
 
     public ZSet except(ZSet other) {
-        return this.distinct().subtract(other.distinct()).distinct();
+        ZSet dA = this.distinct();
+        ZSet dB = other.distinct();
+        ZSet subtracted = dA.subtract(dB);
+        ZSet result = subtracted.distinct();
+        dA.close();
+        dB.close();
+        subtracted.close();
+        return result;
     }
 
     public ZSet intersect(ZSet other) {

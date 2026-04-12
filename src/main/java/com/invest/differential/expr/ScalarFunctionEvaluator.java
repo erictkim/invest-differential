@@ -56,6 +56,37 @@ public final class ScalarFunctionEvaluator implements ExpressionEvaluator {
 
             // String
             case "concat" -> concat(root, rowIndex);
+            case "upper" -> applyStringUnary(root, rowIndex, String::toUpperCase);
+            case "lower" -> applyStringUnary(root, rowIndex, String::toLowerCase);
+            case "char_length", "length" -> {
+                Object v = arguments.get(0).evaluate(root, rowIndex);
+                yield v == null ? null : v.toString().length();
+            }
+            case "substring" -> substring(root, rowIndex);
+            case "trim" -> applyStringUnary(root, rowIndex, String::strip);
+            case "ltrim" -> applyStringUnary(root, rowIndex, String::stripLeading);
+            case "rtrim" -> applyStringUnary(root, rowIndex, String::stripTrailing);
+            case "replace" -> replace(root, rowIndex);
+            case "starts_with" -> {
+                Object s = arguments.get(0).evaluate(root, rowIndex);
+                Object p = arguments.get(1).evaluate(root, rowIndex);
+                yield (s == null || p == null) ? null : s.toString().startsWith(p.toString());
+            }
+
+            // Date/Time
+            case "extract" -> extract(root, rowIndex);
+            case "lt_date", "lte_date", "gt_date", "gte_date", "equal_date" ->
+                    compare(root, rowIndex, switch (functionName) {
+                        case "lt_date" -> -1;
+                        case "gt_date" -> 1;
+                        default -> 0;
+                    });
+            case "add_date_days" -> addDateDays(root, rowIndex);
+            case "subtract_date_days" -> subtractDateDays(root, rowIndex);
+            case "date_trunc" -> dateTrunc(root, rowIndex);
+            case "current_date" -> (int) java.time.LocalDate.now().toEpochDay();
+            case "current_timestamp" -> java.time.Instant.now().toEpochMilli() * 1000L;
+            case "date_diff" -> dateDiff(root, rowIndex);
 
             default -> evaluateUdf(root, rowIndex);
         };
@@ -195,5 +226,175 @@ public final class ScalarFunctionEvaluator implements ExpressionEvaluator {
             sb.append(val);
         }
         return sb.toString();
+    }
+
+    private Object applyStringUnary(VectorSchemaRoot root, int rowIndex,
+                                     java.util.function.Function<String, String> fn) {
+        Object val = arguments.get(0).evaluate(root, rowIndex);
+        if (val == null) return null;
+        return fn.apply(val.toString());
+    }
+
+    private Object substring(VectorSchemaRoot root, int rowIndex) {
+        Object str = arguments.get(0).evaluate(root, rowIndex);
+        if (str == null) return null;
+        String s = str.toString();
+        Object startObj = arguments.get(1).evaluate(root, rowIndex);
+        if (startObj == null) return null;
+        // SQL SUBSTRING is 1-based
+        int start = ((Number) startObj).intValue() - 1;
+        if (start < 0) start = 0;
+        if (start >= s.length()) return "";
+        if (arguments.size() > 2) {
+            Object lenObj = arguments.get(2).evaluate(root, rowIndex);
+            if (lenObj == null) return null;
+            int len = ((Number) lenObj).intValue();
+            int end = Math.min(start + len, s.length());
+            return s.substring(start, end);
+        }
+        return s.substring(start);
+    }
+
+    private Object replace(VectorSchemaRoot root, int rowIndex) {
+        Object str = arguments.get(0).evaluate(root, rowIndex);
+        Object from = arguments.get(1).evaluate(root, rowIndex);
+        Object to = arguments.get(2).evaluate(root, rowIndex);
+        if (str == null || from == null || to == null) return null;
+        return str.toString().replace(from.toString(), to.toString());
+    }
+
+    private Object extract(VectorSchemaRoot root, int rowIndex) {
+        // extract(field, date/timestamp)
+        // The first argument is typically the field name as a literal or an enum
+        Object fieldObj = arguments.get(0).evaluate(root, rowIndex);
+        Object dateObj = arguments.get(1).evaluate(root, rowIndex);
+        if (dateObj == null) return null;
+
+        // Date is stored as epoch days (Integer), timestamp as epoch micros (Long)
+        if (dateObj instanceof Integer epochDays) {
+            java.time.LocalDate date = java.time.LocalDate.ofEpochDay(epochDays);
+            return extractFromDate(fieldObj, date);
+        } else if (dateObj instanceof Long epochMicros) {
+            java.time.LocalDateTime dt = java.time.Instant.ofEpochMilli(epochMicros / 1000)
+                    .atZone(java.time.ZoneOffset.UTC).toLocalDateTime();
+            return extractFromDateTime(fieldObj, dt);
+        }
+        return null;
+    }
+
+    private long extractFromDate(Object field, java.time.LocalDate date) {
+        String f = field.toString().toUpperCase();
+        return switch (f) {
+            case "YEAR" -> date.getYear();
+            case "MONTH" -> date.getMonthValue();
+            case "DAY" -> date.getDayOfMonth();
+            case "DOW", "DAY_OF_WEEK" -> date.getDayOfWeek().getValue();
+            case "DOY", "DAY_OF_YEAR" -> date.getDayOfYear();
+            default -> throw new UnsupportedOperationException("Unsupported extract field: " + f);
+        };
+    }
+
+    private long extractFromDateTime(Object field, java.time.LocalDateTime dt) {
+        String f = field.toString().toUpperCase();
+        return switch (f) {
+            case "YEAR" -> dt.getYear();
+            case "MONTH" -> dt.getMonthValue();
+            case "DAY" -> dt.getDayOfMonth();
+            case "HOUR" -> dt.getHour();
+            case "MINUTE" -> dt.getMinute();
+            case "SECOND" -> dt.getSecond();
+            case "DOW", "DAY_OF_WEEK" -> dt.getDayOfWeek().getValue();
+            case "DOY", "DAY_OF_YEAR" -> dt.getDayOfYear();
+            default -> throw new UnsupportedOperationException("Unsupported extract field: " + f);
+        };
+    }
+
+    private Object addDateDays(VectorSchemaRoot root, int rowIndex) {
+        Object dateObj = arguments.get(0).evaluate(root, rowIndex);
+        Object daysObj = arguments.get(1).evaluate(root, rowIndex);
+        if (dateObj == null || daysObj == null) return null;
+        int epochDays = ((Number) dateObj).intValue();
+        int days = ((Number) daysObj).intValue();
+        return epochDays + days;
+    }
+
+    private Object subtractDateDays(VectorSchemaRoot root, int rowIndex) {
+        Object dateObj = arguments.get(0).evaluate(root, rowIndex);
+        Object daysObj = arguments.get(1).evaluate(root, rowIndex);
+        if (dateObj == null || daysObj == null) return null;
+        int epochDays = ((Number) dateObj).intValue();
+        int days = ((Number) daysObj).intValue();
+        return epochDays - days;
+    }
+
+    private Object dateTrunc(VectorSchemaRoot root, int rowIndex) {
+        // date_trunc(unit, date/timestamp)
+        Object unitObj = arguments.get(0).evaluate(root, rowIndex);
+        Object dateObj = arguments.get(1).evaluate(root, rowIndex);
+        if (unitObj == null || dateObj == null) return null;
+        String unit = unitObj.toString().toUpperCase();
+
+        if (dateObj instanceof Integer epochDays) {
+            java.time.LocalDate date = java.time.LocalDate.ofEpochDay(epochDays);
+            java.time.LocalDate truncated = switch (unit) {
+                case "YEAR" -> date.withDayOfYear(1);
+                case "MONTH" -> date.withDayOfMonth(1);
+                case "QUARTER" -> date.withMonth(((date.getMonthValue() - 1) / 3) * 3 + 1).withDayOfMonth(1);
+                case "WEEK" -> date.with(java.time.DayOfWeek.MONDAY);
+                case "DAY" -> date;
+                default -> throw new UnsupportedOperationException("Unsupported date_trunc unit: " + unit);
+            };
+            return (int) truncated.toEpochDay();
+        } else if (dateObj instanceof Long epochMicros) {
+            java.time.LocalDateTime dt = java.time.Instant.ofEpochMilli(epochMicros / 1000)
+                    .atZone(java.time.ZoneOffset.UTC).toLocalDateTime();
+            java.time.LocalDateTime truncated = switch (unit) {
+                case "YEAR" -> dt.withDayOfYear(1).withHour(0).withMinute(0).withSecond(0).withNano(0);
+                case "MONTH" -> dt.withDayOfMonth(1).withHour(0).withMinute(0).withSecond(0).withNano(0);
+                case "QUARTER" -> dt.withMonth(((dt.getMonthValue() - 1) / 3) * 3 + 1)
+                        .withDayOfMonth(1).withHour(0).withMinute(0).withSecond(0).withNano(0);
+                case "WEEK" -> dt.with(java.time.DayOfWeek.MONDAY).withHour(0).withMinute(0).withSecond(0).withNano(0);
+                case "DAY" -> dt.withHour(0).withMinute(0).withSecond(0).withNano(0);
+                case "HOUR" -> dt.withMinute(0).withSecond(0).withNano(0);
+                case "MINUTE" -> dt.withSecond(0).withNano(0);
+                default -> throw new UnsupportedOperationException("Unsupported date_trunc unit: " + unit);
+            };
+            return truncated.toInstant(java.time.ZoneOffset.UTC).toEpochMilli() * 1000L;
+        }
+        return null;
+    }
+
+    private Object dateDiff(VectorSchemaRoot root, int rowIndex) {
+        // date_diff(unit, date1, date2) — returns date2 - date1 in the given unit
+        Object unitObj = arguments.get(0).evaluate(root, rowIndex);
+        Object date1Obj = arguments.get(1).evaluate(root, rowIndex);
+        Object date2Obj = arguments.get(2).evaluate(root, rowIndex);
+        if (unitObj == null || date1Obj == null || date2Obj == null) return null;
+        String unit = unitObj.toString().toUpperCase();
+
+        if (date1Obj instanceof Integer d1 && date2Obj instanceof Integer d2) {
+            java.time.LocalDate ld1 = java.time.LocalDate.ofEpochDay(d1);
+            java.time.LocalDate ld2 = java.time.LocalDate.ofEpochDay(d2);
+            return switch (unit) {
+                case "DAY" -> (long) java.time.temporal.ChronoUnit.DAYS.between(ld1, ld2);
+                case "WEEK" -> (long) java.time.temporal.ChronoUnit.WEEKS.between(ld1, ld2);
+                case "MONTH" -> (long) java.time.temporal.ChronoUnit.MONTHS.between(ld1, ld2);
+                case "YEAR" -> (long) java.time.temporal.ChronoUnit.YEARS.between(ld1, ld2);
+                default -> throw new UnsupportedOperationException("Unsupported date_diff unit: " + unit);
+            };
+        } else if (date1Obj instanceof Long ts1 && date2Obj instanceof Long ts2) {
+            java.time.LocalDateTime dt1 = java.time.Instant.ofEpochMilli(ts1 / 1000)
+                    .atZone(java.time.ZoneOffset.UTC).toLocalDateTime();
+            java.time.LocalDateTime dt2 = java.time.Instant.ofEpochMilli(ts2 / 1000)
+                    .atZone(java.time.ZoneOffset.UTC).toLocalDateTime();
+            return switch (unit) {
+                case "DAY" -> java.time.temporal.ChronoUnit.DAYS.between(dt1, dt2);
+                case "HOUR" -> java.time.temporal.ChronoUnit.HOURS.between(dt1, dt2);
+                case "MINUTE" -> java.time.temporal.ChronoUnit.MINUTES.between(dt1, dt2);
+                case "SECOND" -> java.time.temporal.ChronoUnit.SECONDS.between(dt1, dt2);
+                default -> throw new UnsupportedOperationException("Unsupported date_diff unit: " + unit);
+            };
+        }
+        return null;
     }
 }

@@ -346,6 +346,16 @@ public final class IncrementalEngine implements AutoCloseable {
         return circuit;
     }
 
+    /**
+     * Enable or disable operator-level metrics collection.
+     */
+    public IncrementalEngine setMetricsEnabled(boolean enabled) {
+        if (circuit != null) {
+            circuit.setMetricsEnabled(enabled);
+        }
+        return this;
+    }
+
     @Override
     public void close() {
         if (circuit != null) {

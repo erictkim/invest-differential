@@ -87,6 +87,7 @@
                 <version>3.2.5</version>
                 <configuration>
                     <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                    <excludedGroups>benchmark</excludedGroups>
                 </configuration>
             </plugin>
             <plugin>

@@ -18,4 +18,7 @@ public interface Operator {
 
     /** Name for debugging. */
     String name();
+
+    /** Per-operator metrics. Returns null if metrics are not tracked. */
+    default OperatorMetrics getMetrics() { return null; }
 }

@@ -891,18 +891,16 @@ public final class PlanCompiler {
             case MINUS_PRIMARY, MINUS_MULTISET -> {
                 Stream left = first;
                 Stream right = compileRel(inputs.get(1));
-                // Build except as: distinct(left) - distinct(right), then distinct
-                IncrementalDistinctOperator distinctLeft = new IncrementalDistinctOperator(left, allocator);
-                circuit.addOperator(distinctLeft);
-                IncrementalDistinctOperator distinctRight = new IncrementalDistinctOperator(right, allocator);
-                circuit.addOperator(distinctRight);
-                // TODO: build a proper except operator; for now use distinct left/right
-                yield distinctLeft.getOutput();
+                ExceptOperator exceptOp = new ExceptOperator(left, right, allocator);
+                circuit.addOperator(exceptOp);
+                yield exceptOp.getOutput();
             }
             case INTERSECTION_PRIMARY, INTERSECTION_MULTISET -> {
-                // Intersect is complex in incremental mode
-                // Simplified: not fully incremental, but correct
-                yield first;
+                Stream left = first;
+                Stream right = compileRel(inputs.get(1));
+                IntersectOperator intersectOp = new IntersectOperator(left, right, allocator);
+                circuit.addOperator(intersectOp);
+                yield intersectOp.getOutput();
             }
             default -> throw new UnsupportedOperationException("Unsupported set operation: " + set.getSetOp());
         };
@@ -1035,6 +1033,8 @@ public final class PlanCompiler {
             return new LiteralEvaluator(lit.value());
         } else if (expr instanceof Expression.VarCharLiteral lit) {
             return new LiteralEvaluator(lit.value());
+        } else if (expr instanceof Expression.FixedCharLiteral lit) {
+            return new LiteralEvaluator(lit.value().stripTrailing());
         } else if (expr instanceof Expression.NullLiteral) {
             return new LiteralEvaluator(null);
         } else if (expr instanceof Expression.ScalarFunctionInvocation func) {
@@ -1167,6 +1167,10 @@ public final class PlanCompiler {
             return "string";
         } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Bool) {
             return "bool";
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Date) {
+            return "date";
+        } else if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Timestamp) {
+            return "timestamp";
         }
         return "string";
     }
