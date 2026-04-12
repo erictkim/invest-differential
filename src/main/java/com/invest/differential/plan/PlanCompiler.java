@@ -40,13 +40,17 @@ public final class PlanCompiler {
     private final UdfRegistry udfRegistry;
 
     public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas) {
-        this(allocator, tableSchemas, null);
+        this(allocator, tableSchemas, null, null);
     }
 
     public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas, UdfRegistry udfRegistry) {
+        this(allocator, tableSchemas, udfRegistry, null);
+    }
+
+    public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas, UdfRegistry udfRegistry, Circuit existingCircuit) {
         this.allocator = allocator;
         this.tableSchemas = tableSchemas;
-        this.circuit = new Circuit();
+        this.circuit = existingCircuit != null ? existingCircuit : new Circuit();
         this.udfRegistry = udfRegistry;
     }
 
@@ -96,6 +100,12 @@ public final class PlanCompiler {
     private Stream compileNamedScan(NamedScan scan) {
         List<String> names = scan.getNames();
         String tableName = names.get(names.size() - 1); // use last segment
+
+        // Reuse existing InputOperator for the same table (multi-query support)
+        InputOperator existing = circuit.findInput(tableName);
+        if (existing != null) {
+            return existing.getOutput();
+        }
 
         Schema schema = tableSchemas.get(tableName);
         if (schema == null) {

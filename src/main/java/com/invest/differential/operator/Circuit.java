@@ -53,6 +53,18 @@ public final class Circuit {
     }
 
     /**
+     * Find an existing InputOperator by table name, or null if not found.
+     */
+    public InputOperator findInput(String tableName) {
+        for (InputOperator inp : inputs) {
+            if (inp.tableName().equalsIgnoreCase(tableName)) {
+                return inp;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Close all operator state and release Arrow resources.
      */
     public void close() {

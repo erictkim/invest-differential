@@ -38,6 +38,7 @@ public final class IncrementalEngine implements AutoCloseable {
     private final boolean ownsAllocator;
     private final Map<String, Schema> tableSchemas = new LinkedHashMap<>();
     private final UdfRegistry udfRegistry = new UdfRegistry();
+    private final Map<String, Integer> outputNames = new LinkedHashMap<>();
     private Circuit circuit;
     private boolean compiled;
 
@@ -112,8 +113,22 @@ public final class IncrementalEngine implements AutoCloseable {
 
     /**
      * Compile a SQL query into the incremental circuit.
+     * Can be called multiple times to add multiple views over the same input tables.
+     * Each call adds one output, accessible via {@link #getOutput(int)} using the
+     * order in which queries were added, or via {@link #getOutput(String)} using
+     * the view name assigned by {@link #sql(String, String)}.
      */
     public IncrementalEngine sql(String sqlQuery) {
+        return sql(sqlQuery, null);
+    }
+
+    /**
+     * Compile a named SQL query into the incremental circuit.
+     *
+     * @param sqlQuery the SQL query
+     * @param viewName optional name for this view (for retrieval via {@link #getOutput(String)})
+     */
+    public IncrementalEngine sql(String sqlQuery, String viewName) {
         try {
             // Build CREATE TABLE statements for Calcite schema
             List<String> createStatements = new ArrayList<>();
@@ -133,7 +148,7 @@ public final class IncrementalEngine implements AutoCloseable {
 
             ProtoPlanConverter planConverter = new ProtoPlanConverter(extensions);
             Plan plan = planConverter.from(protoPlan);
-            return plan(plan);
+            return addPlan(plan, viewName);
         } catch (Exception e) {
             throw new RuntimeException("Failed to compile SQL: " + sqlQuery, e);
         }
@@ -141,14 +156,33 @@ public final class IncrementalEngine implements AutoCloseable {
 
     /**
      * Compile a Substrait plan (POJO) into the incremental circuit.
+     * For single-query usage. For multi-query, use {@link #sql(String)} multiple times.
      */
     public IncrementalEngine plan(Plan plan) {
-        if (compiled) {
-            throw new IllegalStateException("Circuit already compiled");
+        return addPlan(plan, null);
+    }
+
+    private IncrementalEngine addPlan(Plan plan, String viewName) {
+        if (circuit == null) {
+            circuit = new Circuit();
         }
-        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas, udfRegistry);
-        this.circuit = compiler.compile(plan);
+        int outputsBefore = circuit.getOutputs().size();
+        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas, udfRegistry, circuit);
+        compiler.compile(plan);
         this.compiled = true;
+
+        // Register view names for newly added outputs
+        int outputsAfter = circuit.getOutputs().size();
+        if (viewName != null) {
+            outputNames.put(viewName.toLowerCase(java.util.Locale.ROOT), outputsBefore);
+        }
+        // Auto-generate names for unnamed views
+        for (int i = outputsBefore; i < outputsAfter; i++) {
+            String autoName = "view_" + i;
+            if (!outputNames.containsValue(i)) {
+                outputNames.putIfAbsent(autoName, i);
+            }
+        }
         return this;
     }
 
@@ -217,6 +251,15 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Get the output delta for a named view.
+     *
+     * @param viewName the view name assigned via {@link #sql(String, String)}
+     */
+    public ZSet getOutput(String viewName) {
+        return getOutput(resolveViewIndex(viewName));
+    }
+
+    /**
      * Get the full materialized snapshot of the view — the accumulated result of all
      * output deltas across all steps, compacted to remove zero-weight entries.
      *
@@ -238,6 +281,22 @@ public final class IncrementalEngine implements AutoCloseable {
         ZSet snapshot = outputs.get(index).getSnapshot();
         return ZSet.fromRoot(snapshot.dataSchema(),
                 ArrowUtils.cloneRoot(snapshot.data(), allocator), allocator);
+    }
+
+    /**
+     * Get the full materialized snapshot for a named view.
+     *
+     * @param viewName the view name assigned via {@link #sql(String, String)}
+     */
+    public ZSet getSnapshot(String viewName) {
+        return getSnapshot(resolveViewIndex(viewName));
+    }
+
+    /**
+     * Get the number of compiled outputs (views).
+     */
+    public int getOutputCount() {
+        return circuit != null ? circuit.getOutputs().size() : 0;
     }
 
     /**
@@ -278,6 +337,14 @@ public final class IncrementalEngine implements AutoCloseable {
         if (!compiled) {
             throw new IllegalStateException("No query compiled yet. Call sql() or plan() first.");
         }
+    }
+
+    private int resolveViewIndex(String viewName) {
+        Integer index = outputNames.get(viewName.toLowerCase(java.util.Locale.ROOT));
+        if (index == null) {
+            throw new IllegalArgumentException("Unknown view: " + viewName);
+        }
+        return index;
     }
 
     private String buildCreateTable(String name, Schema schema) {

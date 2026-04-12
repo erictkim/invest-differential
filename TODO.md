@@ -25,7 +25,7 @@ Currently throws `UnsupportedOperationException`. While tricky for incremental s
 ### 7. ~~Aggregate UDFs (UDAFs)~~ ✅
 Only scalar UDFs exist in `UdfRegistry`. Allowing user-defined aggregate functions (`registerUdaf`) would unlock custom analytics.
 
-### 8. Multi-Query Support
+### 8. ~~Multi-Query Support~~ ✅
 The engine compiles a single SQL query. Supporting multiple views over the same input tables (shared scan/filter operators) would avoid redundant computation.
 
 ## Lower Priority
