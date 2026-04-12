@@ -38,35 +38,52 @@ public final class PlanCompiler {
     private final Map<String, Schema> tableSchemas;
     private final Circuit circuit;
     private final UdfRegistry udfRegistry;
+    private final Map<String, Stream> viewStreams;
+    private final List<Stream> lastResultStreams = new ArrayList<>();
 
     public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas) {
-        this(allocator, tableSchemas, null, null);
+        this(allocator, tableSchemas, null, null, null);
     }
 
     public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas, UdfRegistry udfRegistry) {
-        this(allocator, tableSchemas, udfRegistry, null);
+        this(allocator, tableSchemas, udfRegistry, null, null);
     }
 
     public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas, UdfRegistry udfRegistry, Circuit existingCircuit) {
+        this(allocator, tableSchemas, udfRegistry, existingCircuit, null);
+    }
+
+    public PlanCompiler(BufferAllocator allocator, Map<String, Schema> tableSchemas, UdfRegistry udfRegistry, Circuit existingCircuit, Map<String, Stream> viewStreams) {
         this.allocator = allocator;
         this.tableSchemas = tableSchemas;
         this.circuit = existingCircuit != null ? existingCircuit : new Circuit();
         this.udfRegistry = udfRegistry;
+        this.viewStreams = viewStreams != null ? viewStreams : Map.of();
     }
 
     /**
      * Compile a Substrait plan into a Circuit.
      */
     public Circuit compile(Plan plan) {
+        lastResultStreams.clear();
         for (Plan.Root root : plan.getRoots()) {
             Rel rel = root.getInput();
             Stream result = compileRel(rel);
+            lastResultStreams.add(result);
 
             // Wrap with output operator
             OutputOperator outputOp = new OutputOperator("output", result, allocator);
             circuit.addOperator(outputOp);
         }
         return circuit;
+    }
+
+    /**
+     * Get the result streams from the most recent {@link #compile} call.
+     * Each stream corresponds to one plan root and feeds the matching OutputOperator.
+     */
+    public List<Stream> getLastResultStreams() {
+        return lastResultStreams;
     }
 
     private Stream compileRel(Rel rel) {
@@ -100,6 +117,12 @@ public final class PlanCompiler {
     private Stream compileNamedScan(NamedScan scan) {
         List<String> names = scan.getNames();
         String tableName = names.get(names.size() - 1); // use last segment
+
+        // Check if this references a previously compiled view
+        Stream viewStream = viewStreams.get(tableName.toLowerCase(java.util.Locale.ROOT));
+        if (viewStream != null) {
+            return viewStream;
+        }
 
         // Reuse existing InputOperator for the same table (multi-query support)
         InputOperator existing = circuit.findInput(tableName);
@@ -677,19 +700,30 @@ public final class PlanCompiler {
         int leftColCount = leftSchema.getFields().size();
         final int[] finalEmitIndices = emitIndices;
 
+        // Adjust right key columns (they reference the combined left+right schema)
+        int[] adjustedRightKeys = new int[rightKeyCols.length];
+        for (int i = 0; i < rightKeyCols.length; i++) {
+            adjustedRightKeys[i] = rightKeyCols[i] - leftColCount;
+        }
+
+        // IndexedZSet reorders columns: [keyCols..., valueCols..., weight].
+        // Compute mapping from original column index to indexed position.
+        int[] leftOrigToIndexed = origToIndexedMapping(leftColCount, leftKeyCols);
+        int[] rightOrigToIndexed = origToIndexedMapping(rightSchema.getFields().size(), adjustedRightKeys);
+
         RowCombiner valueCombiner = (left, leftRow, right, rightRow) -> {
             // "left" and "right" here are the indexed ZSet's data (key+value+weight)
-            // We need to combine the value portions
+            // We need to combine the value portions using the orig-to-indexed mapping
             int leftVals = leftSchema.getFields().size();
             int rightVals = rightSchema.getFields().size();
             int totalCols = leftVals + rightVals;
 
             Object[] allValues = new Object[totalCols];
             for (int i = 0; i < leftVals; i++) {
-                allValues[i] = ArrowUtils.getValue(left.getVector(i), leftRow);
+                allValues[i] = ArrowUtils.getValue(left.getVector(leftOrigToIndexed[i]), leftRow);
             }
             for (int i = 0; i < rightVals; i++) {
-                allValues[leftVals + i] = ArrowUtils.getValue(right.getVector(i), rightRow);
+                allValues[leftVals + i] = ArrowUtils.getValue(right.getVector(rightOrigToIndexed[i]), rightRow);
             }
 
             if (finalEmitIndices != null) {
@@ -728,12 +762,6 @@ public final class PlanCompiler {
             }
         }
 
-        // Adjust right key columns (they reference the combined left+right schema)
-        int[] adjustedRightKeys = new int[rightKeyCols.length];
-        for (int i = 0; i < rightKeyCols.length; i++) {
-            adjustedRightKeys[i] = rightKeyCols[i] - leftColCount;
-        }
-
         // Build RowMappers for unmatched rows in outer joins and SEMI/ANTI
         RowMapper unmatchedLeftMapper = null;
         RowMapper unmatchedRightMapper = null;
@@ -762,7 +790,7 @@ public final class PlanCompiler {
             unmatchedLeftMapper = (data, row) -> {
                 Object[] allValues = new Object[totalRaw];
                 for (int i = 0; i < leftV; i++) {
-                    allValues[i] = ArrowUtils.getValue(data.getVector(i), row);
+                    allValues[i] = ArrowUtils.getValue(data.getVector(leftOrigToIndexed[i]), row);
                 }
                 if (finalEmitIndices != null) {
                     Object[] emitted = new Object[finalEmitIndices.length];
@@ -776,7 +804,7 @@ public final class PlanCompiler {
             unmatchedRightMapper = (data, row) -> {
                 Object[] allValues = new Object[totalRaw];
                 for (int i = 0; i < rightV; i++) {
-                    allValues[leftV + i] = ArrowUtils.getValue(data.getVector(i), row);
+                    allValues[leftV + i] = ArrowUtils.getValue(data.getVector(rightOrigToIndexed[i]), row);
                 }
                 if (finalEmitIndices != null) {
                     Object[] emitted = new Object[finalEmitIndices.length];
@@ -1052,6 +1080,26 @@ public final class PlanCompiler {
             }
         }
         throw new UnsupportedOperationException("Complex field reference not supported: " + ref);
+    }
+
+    /**
+     * Compute mapping from original column index to position in IndexedZSet data.
+     * IndexedZSet.fromZSet() reorders columns as: [keyCols..., valueCols..., weight].
+     */
+    private static int[] origToIndexedMapping(int numCols, int[] keyCols) {
+        java.util.Set<Integer> keySet = new HashSet<>();
+        for (int k : keyCols) keySet.add(k);
+        int[] mapping = new int[numCols];
+        for (int i = 0; i < keyCols.length; i++) {
+            mapping[keyCols[i]] = i;
+        }
+        int valPos = keyCols.length;
+        for (int i = 0; i < numCols; i++) {
+            if (!keySet.contains(i)) {
+                mapping[i] = valPos++;
+            }
+        }
+        return mapping;
     }
 
     private int[][] extractJoinKeys(Expression condition, int leftSchemaSize) {

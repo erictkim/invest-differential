@@ -1305,10 +1305,9 @@ class DemoTest {
                 d.compact();
                 Map<List<Object>, Integer> rows = toMap(d);
                 // Only orders for Gold customers (Alice=1, Charlie=3)
-                // Column order: cust_id, order_id, product, amount (join key first)
                 assertEquals(2, rows.size());
-                assertEquals(1, rows.get(List.of(1, 101, "Laptop", 999)));
-                assertEquals(1, rows.get(List.of(3, 103, "Monitor", 349)));
+                assertEquals(1, rows.get(List.of(101, 1, "Laptop", 999)));
+                assertEquals(1, rows.get(List.of(103, 3, "Monitor", 349)));
             }
         }
     }
@@ -1339,7 +1338,7 @@ class DemoTest {
                 d1.compact();
                 Map<List<Object>, Integer> rows = toMap(d1);
                 assertEquals(1, rows.size());
-                assertEquals(1, rows.get(List.of(1, 101, "Laptop", 999)));
+                assertEquals(1, rows.get(List.of(101, 1, "Laptop", 999)));
             }
 
             // Step 2: Bob upgrades to Gold
@@ -1356,7 +1355,7 @@ class DemoTest {
                 Map<List<Object>, Integer> rows = toMap(d2);
                 // Bob's order now appears
                 assertEquals(1, rows.size());
-                assertEquals(1, rows.get(List.of(2, 102, "Mouse", 25)));
+                assertEquals(1, rows.get(List.of(102, 2, "Mouse", 25)));
             }
         }
     }

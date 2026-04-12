@@ -4,6 +4,7 @@ import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.operator.Circuit;
 import com.invest.differential.operator.InputOperator;
 import com.invest.differential.operator.OutputOperator;
+import com.invest.differential.operator.Stream;
 import com.invest.differential.plan.PlanCompiler;
 import com.invest.differential.udf.AggregateUdf;
 import com.invest.differential.udf.ScalarUdf;
@@ -39,6 +40,8 @@ public final class IncrementalEngine implements AutoCloseable {
     private final Map<String, Schema> tableSchemas = new LinkedHashMap<>();
     private final UdfRegistry udfRegistry = new UdfRegistry();
     private final Map<String, Integer> outputNames = new LinkedHashMap<>();
+    private final Map<String, Stream> viewStreams = new LinkedHashMap<>();
+    private final Map<String, Schema> viewSchemas = new LinkedHashMap<>();
     private Circuit circuit;
     private boolean compiled;
 
@@ -135,6 +138,10 @@ public final class IncrementalEngine implements AutoCloseable {
             for (Map.Entry<String, Schema> entry : tableSchemas.entrySet()) {
                 createStatements.add(buildCreateTable(entry.getKey(), entry.getValue()));
             }
+            // Also register existing views as virtual tables so they can be referenced
+            for (Map.Entry<String, Schema> entry : viewSchemas.entrySet()) {
+                createStatements.add(buildCreateTable(entry.getKey(), entry.getValue()));
+            }
 
             io.substrait.proto.Plan protoPlan;
             io.substrait.extension.SimpleExtension.ExtensionCollection extensions;
@@ -167,14 +174,30 @@ public final class IncrementalEngine implements AutoCloseable {
             circuit = new Circuit();
         }
         int outputsBefore = circuit.getOutputs().size();
-        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas, udfRegistry, circuit);
+        PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas, udfRegistry, circuit, viewStreams);
         compiler.compile(plan);
         this.compiled = true;
 
-        // Register view names for newly added outputs
+        // Register view names and streams for newly added outputs
         int outputsAfter = circuit.getOutputs().size();
+        List<Stream> resultStreams = compiler.getLastResultStreams();
         if (viewName != null) {
-            outputNames.put(viewName.toLowerCase(java.util.Locale.ROOT), outputsBefore);
+            String key = viewName.toLowerCase(java.util.Locale.ROOT);
+            outputNames.put(key, outputsBefore);
+            if (!resultStreams.isEmpty()) {
+                viewStreams.put(key, resultStreams.get(0));
+                // Build view schema with correct column names from the Substrait plan root
+                Plan.Root root = plan.getRoots().get(0);
+                List<String> names = root.getNames();
+                Schema streamSchema = resultStreams.get(0).dataSchema();
+                List<org.apache.arrow.vector.types.pojo.Field> viewFields = new ArrayList<>();
+                for (int i = 0; i < names.size() && i < streamSchema.getFields().size(); i++) {
+                    org.apache.arrow.vector.types.pojo.Field original = streamSchema.getFields().get(i);
+                    viewFields.add(new org.apache.arrow.vector.types.pojo.Field(
+                            names.get(i), original.getFieldType(), original.getChildren()));
+                }
+                viewSchemas.put(key, new Schema(viewFields));
+            }
         }
         // Auto-generate names for unnamed views
         for (int i = outputsBefore; i < outputsAfter; i++) {
