@@ -307,9 +307,10 @@ public final class PlanCompiler {
                 int lowerOffset = toBoundOffset(wfi.lowerBound());
                 IncrementalWindowOperator.BoundType upperType = toBoundType(wfi.upperBound(), false);
                 int upperOffset = toBoundOffset(wfi.upperBound());
+                IncrementalWindowOperator.BoundsMode boundsMode = toBoundsMode(wfi.boundsType());
 
                 specs.add(new IncrementalWindowOperator.WindowFunctionSpec(
-                        funcName, inputCol, lowerType, lowerOffset, upperType, upperOffset));
+                        funcName, inputCol, lowerType, lowerOffset, upperType, upperOffset, boundsMode));
 
                 String fieldName = "w_" + funcName + "_" + idx;
                 outputFields.add(SubstraitTypeMapper.toArrowField(fieldName, wfi.outputType()));
@@ -959,9 +960,10 @@ public final class PlanCompiler {
             int lowerOffset = toBoundOffset(wf.lowerBound());
             IncrementalWindowOperator.BoundType upperType = toBoundType(wf.upperBound(), false);
             int upperOffset = toBoundOffset(wf.upperBound());
+            IncrementalWindowOperator.BoundsMode boundsMode = toBoundsMode(wf.boundsType());
 
             specs.add(new IncrementalWindowOperator.WindowFunctionSpec(
-                    funcName, inputCol, lowerType, lowerOffset, upperType, upperOffset));
+                    funcName, inputCol, lowerType, lowerOffset, upperType, upperOffset, boundsMode));
 
             // Add output field
             String fieldName = "w" + i + "_" + funcName;
@@ -1011,6 +1013,13 @@ public final class PlanCompiler {
             return (int) f.offset();
         }
         return 0;
+    }
+
+    private IncrementalWindowOperator.BoundsMode toBoundsMode(Expression.WindowBoundsType type) {
+        return switch (type) {
+            case RANGE -> IncrementalWindowOperator.BoundsMode.RANGE;
+            default -> IncrementalWindowOperator.BoundsMode.ROWS;
+        };
     }
 
     // ---- Expression Compiler ----

@@ -234,7 +234,7 @@ public final class IncrementalWindowOperator implements Operator {
             }
             case "sum" -> {
                 int col = spec.inputColumn();
-                int[] bounds = resolveFrameBounds(spec, partition.size(), currentPos);
+                int[] bounds = resolveFrameBounds(spec, root, partition, partition.size(), currentPos);
                 long sum = 0;
                 for (int i = bounds[0]; i <= bounds[1]; i++) {
                     Object val = ArrowUtils.getValue(root.getVector(col), partition.get(i));
@@ -245,7 +245,7 @@ public final class IncrementalWindowOperator implements Operator {
                 yield sum;
             }
             case "count" -> {
-                int[] bounds = resolveFrameBounds(spec, partition.size(), currentPos);
+                int[] bounds = resolveFrameBounds(spec, root, partition, partition.size(), currentPos);
                 long count = 0;
                 if (spec.inputColumn() >= 0) {
                     int col = spec.inputColumn();
@@ -260,7 +260,7 @@ public final class IncrementalWindowOperator implements Operator {
             }
             case "min" -> {
                 int col = spec.inputColumn();
-                int[] bounds = resolveFrameBounds(spec, partition.size(), currentPos);
+                int[] bounds = resolveFrameBounds(spec, root, partition, partition.size(), currentPos);
                 Comparable<Object> min = null;
                 for (int i = bounds[0]; i <= bounds[1]; i++) {
                     Object val = ArrowUtils.getValue(root.getVector(col), partition.get(i));
@@ -275,7 +275,7 @@ public final class IncrementalWindowOperator implements Operator {
             }
             case "max" -> {
                 int col = spec.inputColumn();
-                int[] bounds = resolveFrameBounds(spec, partition.size(), currentPos);
+                int[] bounds = resolveFrameBounds(spec, root, partition, partition.size(), currentPos);
                 Comparable<Object> max = null;
                 for (int i = bounds[0]; i <= bounds[1]; i++) {
                     Object val = ArrowUtils.getValue(root.getVector(col), partition.get(i));
@@ -295,8 +295,20 @@ public final class IncrementalWindowOperator implements Operator {
     /**
      * Resolve frame bounds for a given partition size and current position.
      * Returns [startIdx, endIdx] (inclusive) within the partition.
+     * Dispatches to ROWS or RANGE mode based on the spec.
      */
-    private int[] resolveFrameBounds(WindowFunctionSpec spec, int partitionSize, int currentPos) {
+    private int[] resolveFrameBounds(WindowFunctionSpec spec, VectorSchemaRoot root,
+                                      List<Integer> partition, int partitionSize, int currentPos) {
+        if (spec.boundsMode() == BoundsMode.RANGE && orderColumns.length > 0) {
+            return resolveRangeFrameBounds(spec, root, partition, partitionSize, currentPos);
+        }
+        return resolveRowsFrameBounds(spec, partitionSize, currentPos);
+    }
+
+    /**
+     * ROWS mode: positional offset from current row.
+     */
+    private int[] resolveRowsFrameBounds(WindowFunctionSpec spec, int partitionSize, int currentPos) {
         int start;
         int end;
 
@@ -316,6 +328,109 @@ public final class IncrementalWindowOperator implements Operator {
             default -> end = partitionSize - 1;
         }
 
+        return new int[]{start, end};
+    }
+
+    /**
+     * RANGE mode: value-based offset from the ORDER BY column value of the current row.
+     * For RANGE BETWEEN N PRECEDING AND CURRENT ROW, includes all rows in the
+     * partition whose ORDER BY value is between (currentValue - N) and currentValue.
+     */
+    @SuppressWarnings("unchecked")
+    private int[] resolveRangeFrameBounds(WindowFunctionSpec spec, VectorSchemaRoot root,
+                                           List<Integer> partition, int partitionSize, int currentPos) {
+        int orderCol = orderColumns[0]; // RANGE uses the first ORDER BY column
+        Object currentVal = ArrowUtils.getValue(root.getVector(orderCol), partition.get(currentPos));
+        long currentNum = currentVal instanceof Number n ? n.longValue() : 0L;
+
+        int start;
+        int end;
+
+        // Resolve lower bound
+        switch (spec.lowerBoundType()) {
+            case UNBOUNDED_PRECEDING -> start = 0;
+            case CURRENT_ROW -> {
+                // All rows with the same ORDER BY value (peers)
+                start = currentPos;
+                while (start > 0) {
+                    Object v = ArrowUtils.getValue(root.getVector(orderCol), partition.get(start - 1));
+                    long vNum = v instanceof Number nn ? nn.longValue() : 0L;
+                    if (vNum != currentNum) break;
+                    start--;
+                }
+            }
+            case PRECEDING -> {
+                long lowerBound = currentNum - spec.lowerBoundOffset();
+                start = 0;
+                // Binary-search style: find first row >= lowerBound
+                for (int i = 0; i < partitionSize; i++) {
+                    Object v = ArrowUtils.getValue(root.getVector(orderCol), partition.get(i));
+                    long vNum = v instanceof Number nn ? nn.longValue() : 0L;
+                    if (orderAscending[0] ? vNum >= lowerBound : vNum <= lowerBound) {
+                        start = i;
+                        break;
+                    }
+                }
+            }
+            case FOLLOWING -> {
+                long lowerBound = currentNum + spec.lowerBoundOffset();
+                start = currentPos;
+                for (int i = currentPos; i < partitionSize; i++) {
+                    Object v = ArrowUtils.getValue(root.getVector(orderCol), partition.get(i));
+                    long vNum = v instanceof Number nn ? nn.longValue() : 0L;
+                    if (orderAscending[0] ? vNum >= lowerBound : vNum <= lowerBound) {
+                        start = i;
+                        break;
+                    }
+                    if (i == partitionSize - 1) start = partitionSize; // nothing qualifies
+                }
+            }
+            default -> start = 0;
+        }
+
+        // Resolve upper bound
+        switch (spec.upperBoundType()) {
+            case UNBOUNDED_FOLLOWING -> end = partitionSize - 1;
+            case CURRENT_ROW -> {
+                // All rows with the same ORDER BY value (peers)
+                end = currentPos;
+                while (end < partitionSize - 1) {
+                    Object v = ArrowUtils.getValue(root.getVector(orderCol), partition.get(end + 1));
+                    long vNum = v instanceof Number nn ? nn.longValue() : 0L;
+                    if (vNum != currentNum) break;
+                    end++;
+                }
+            }
+            case PRECEDING -> {
+                long upperBound = currentNum - spec.upperBoundOffset();
+                end = -1;
+                for (int i = partitionSize - 1; i >= 0; i--) {
+                    Object v = ArrowUtils.getValue(root.getVector(orderCol), partition.get(i));
+                    long vNum = v instanceof Number nn ? nn.longValue() : 0L;
+                    if (orderAscending[0] ? vNum <= upperBound : vNum >= upperBound) {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+            case FOLLOWING -> {
+                long upperBound = currentNum + spec.upperBoundOffset();
+                end = partitionSize - 1;
+                for (int i = partitionSize - 1; i >= 0; i--) {
+                    Object v = ArrowUtils.getValue(root.getVector(orderCol), partition.get(i));
+                    long vNum = v instanceof Number nn ? nn.longValue() : 0L;
+                    if (orderAscending[0] ? vNum <= upperBound : vNum >= upperBound) {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+            default -> end = partitionSize - 1;
+        }
+
+        if (start > end || start >= partitionSize || end < 0) {
+            return new int[]{0, -1}; // empty frame
+        }
         return new int[]{start, end};
     }
 
@@ -395,25 +510,39 @@ public final class IncrementalWindowOperator implements Operator {
         FOLLOWING
     }
 
+    public enum BoundsMode {
+        ROWS,  // positional offset from current row
+        RANGE  // value offset from ORDER BY column value
+    }
+
     public record WindowFunctionSpec(
             String functionName,
             int inputColumn,       // -1 for functions without column arg (e.g. ROW_NUMBER, COUNT(*))
             BoundType lowerBoundType,
             int lowerBoundOffset,  // only used for PRECEDING/FOLLOWING
             BoundType upperBoundType,
-            int upperBoundOffset   // only used for PRECEDING/FOLLOWING
+            int upperBoundOffset,  // only used for PRECEDING/FOLLOWING
+            BoundsMode boundsMode  // ROWS or RANGE
     ) {
         public static WindowFunctionSpec ranking(String functionName) {
             return new WindowFunctionSpec(functionName, -1,
                     BoundType.UNBOUNDED_PRECEDING, 0,
-                    BoundType.CURRENT_ROW, 0);
+                    BoundType.CURRENT_ROW, 0,
+                    BoundsMode.ROWS);
         }
 
         public static WindowFunctionSpec aggregate(String functionName, int inputColumn,
                                                     BoundType lowerType, int lowerOffset,
                                                     BoundType upperType, int upperOffset) {
             return new WindowFunctionSpec(functionName, inputColumn,
-                    lowerType, lowerOffset, upperType, upperOffset);
+                    lowerType, lowerOffset, upperType, upperOffset, BoundsMode.ROWS);
+        }
+
+        public static WindowFunctionSpec rangeAggregate(String functionName, int inputColumn,
+                                                        BoundType lowerType, int lowerOffset,
+                                                        BoundType upperType, int upperOffset) {
+            return new WindowFunctionSpec(functionName, inputColumn,
+                    lowerType, lowerOffset, upperType, upperOffset, BoundsMode.RANGE);
         }
     }
 }
