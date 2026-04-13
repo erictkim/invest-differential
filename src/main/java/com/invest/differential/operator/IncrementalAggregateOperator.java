@@ -2,14 +2,16 @@ package com.invest.differential.operator;
 
 import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.arrow.RowHasher;
+import com.invest.differential.parallel.ParallelConfig;
 import com.invest.differential.zset.AggregateDescription;
 import com.invest.differential.zset.IndexedZSet;
 import com.invest.differential.zset.ZSet;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-import java.util.HashSet;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.RecursiveTask;
 import java.util.function.Function;
 
 /**
@@ -38,6 +40,7 @@ public final class IncrementalAggregateOperator<R, IR> implements Operator {
     private ZSet accumulatedInput;  // full input (sum of all deltas)
     private ZSet previousOutput;    // previous aggregate output (full)
     private final int[] outputKeyColumns; // group-by key positions in output schema (0..K-1)
+    private ParallelConfig parallelConfig = ParallelConfig.disabled();
 
     public IncrementalAggregateOperator(Stream input, int[] groupByColumns,
                                          Schema outputDataSchema,
@@ -57,6 +60,11 @@ public final class IncrementalAggregateOperator<R, IR> implements Operator {
         this.previousOutput = ZSet.empty(outputDataSchema, allocator);
         this.outputKeyColumns = new int[groupByColumns.length];
         for (int i = 0; i < groupByColumns.length; i++) outputKeyColumns[i] = i;
+    }
+
+    @Override
+    public void setParallelConfig(ParallelConfig config) {
+        this.parallelConfig = config != null ? config : ParallelConfig.disabled();
     }
 
     @Override

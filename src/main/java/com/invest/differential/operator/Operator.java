@@ -1,5 +1,7 @@
 package com.invest.differential.operator;
 
+import com.invest.differential.parallel.ParallelConfig;
+
 /**
  * Base interface for all operators in the dataflow graph.
  */
@@ -21,4 +23,7 @@ public interface Operator {
 
     /** Per-operator metrics. Returns null if metrics are not tracked. */
     default OperatorMetrics getMetrics() { return null; }
+
+    /** Set the parallel config for intra-operator data parallelism. */
+    default void setParallelConfig(ParallelConfig config) { /* no-op by default */ }
 }

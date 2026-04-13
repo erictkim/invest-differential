@@ -5,6 +5,7 @@ import com.invest.differential.operator.Circuit;
 import com.invest.differential.operator.InputOperator;
 import com.invest.differential.operator.OutputOperator;
 import com.invest.differential.operator.Stream;
+import com.invest.differential.parallel.ParallelConfig;
 import com.invest.differential.plan.PlanCompiler;
 import com.invest.differential.udf.AggregateUdf;
 import com.invest.differential.udf.ScalarUdf;
@@ -44,6 +45,7 @@ public final class IncrementalEngine implements AutoCloseable {
     private final Map<String, Schema> viewSchemas = new LinkedHashMap<>();
     private Circuit circuit;
     private boolean compiled;
+    private ParallelConfig parallelConfig = ParallelConfig.disabled();
 
     private IncrementalEngine(BufferAllocator allocator, boolean ownsAllocator) {
         this.allocator = allocator;
@@ -172,11 +174,14 @@ public final class IncrementalEngine implements AutoCloseable {
     private IncrementalEngine addPlan(Plan plan, String viewName) {
         if (circuit == null) {
             circuit = new Circuit();
+            circuit.setParallelConfig(parallelConfig);
         }
         int outputsBefore = circuit.getOutputs().size();
         PlanCompiler compiler = new PlanCompiler(allocator, tableSchemas, udfRegistry, circuit, viewStreams);
         compiler.compile(plan);
         this.compiled = true;
+        // Propagate parallel config to newly added operators
+        circuit.setParallelConfig(parallelConfig);
 
         // Register view names and streams for newly added outputs
         int outputsAfter = circuit.getOutputs().size();
@@ -356,10 +361,42 @@ public final class IncrementalEngine implements AutoCloseable {
         return this;
     }
 
+    /**
+     * Enable parallel execution with default settings (uses available processors).
+     */
+    public IncrementalEngine setParallel(boolean enabled) {
+        this.parallelConfig = enabled ? ParallelConfig.withDefaults() : ParallelConfig.disabled();
+        if (circuit != null) {
+            circuit.setParallelConfig(parallelConfig);
+        }
+        return this;
+    }
+
+    /**
+     * Set a specific parallel configuration. Pass {@code ParallelConfig.disabled()} to disable.
+     */
+    public IncrementalEngine setParallelConfig(ParallelConfig config) {
+        this.parallelConfig = config != null ? config : ParallelConfig.disabled();
+        if (circuit != null) {
+            circuit.setParallelConfig(parallelConfig);
+        }
+        return this;
+    }
+
+    /**
+     * Get the current parallel configuration.
+     */
+    public ParallelConfig getParallelConfig() {
+        return parallelConfig;
+    }
+
     @Override
     public void close() {
         if (circuit != null) {
             circuit.close();
+        }
+        if (parallelConfig != null) {
+            parallelConfig.shutdown();
         }
         if (ownsAllocator) {
             allocator.close();

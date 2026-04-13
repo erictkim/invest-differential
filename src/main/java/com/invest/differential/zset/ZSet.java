@@ -449,6 +449,64 @@ public final class ZSet implements AutoCloseable {
         return result;
     }
 
+    // ---- Partitioning (for parallel execution) ----
+
+    /**
+     * Hash-partition this ZSet into N parts by the given key columns.
+     * Each row goes to partition (hash(keyColumns) mod n).
+     * The caller owns all returned ZSets.
+     */
+    public ZSet[] hashPartition(int[] keyColumns, int n) {
+        if (n <= 1) {
+            // Single partition: clone
+            return new ZSet[]{ ZSet.fromRoot(dataSchema, ArrowUtils.cloneRoot(data, allocator), allocator) };
+        }
+
+        VectorSchemaRoot[] roots = new VectorSchemaRoot[n];
+        int[] counts = new int[n];
+        for (int i = 0; i < n; i++) {
+            roots[i] = VectorSchemaRoot.create(fullSchema, allocator);
+            roots[i].allocateNew();
+        }
+
+        int rowCount = data.getRowCount();
+        for (int row = 0; row < rowCount; row++) {
+            int hash = RowHasher.hashRow(data, row, keyColumns);
+            int part = Math.floorMod(hash, n);
+            ArrowUtils.copyRow(data, row, roots[part], counts[part]);
+            counts[part]++;
+        }
+
+        ZSet[] result = new ZSet[n];
+        for (int i = 0; i < n; i++) {
+            roots[i].setRowCount(counts[i]);
+            result[i] = new ZSet(allocator, dataSchema, roots[i], false);
+        }
+        return result;
+    }
+
+    /**
+     * Concatenate multiple ZSets into one. All must share the same dataSchema.
+     * The input ZSets are NOT closed by this method.
+     */
+    public static ZSet concat(ZSet[] parts, Schema dataSchema, BufferAllocator allocator) {
+        int totalRows = 0;
+        for (ZSet p : parts) totalRows += p.data.getRowCount();
+
+        Schema full = ArrowUtils.createSchemaWithWeight(dataSchema);
+        VectorSchemaRoot result = VectorSchemaRoot.create(full, allocator);
+        result.allocateNew();
+        int outRow = 0;
+        for (ZSet p : parts) {
+            for (int row = 0; row < p.data.getRowCount(); row++) {
+                ArrowUtils.copyRow(p.data, row, result, outRow);
+                outRow++;
+            }
+        }
+        result.setRowCount(totalRows);
+        return new ZSet(allocator, dataSchema, result, false);
+    }
+
     /**
      * Append the entries of another ZSet into this one (mutating).
      * Used by IntegrateOperator for efficient accumulation.

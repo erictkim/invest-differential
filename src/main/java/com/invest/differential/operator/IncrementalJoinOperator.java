@@ -2,6 +2,7 @@ package com.invest.differential.operator;
 
 import com.invest.differential.arrow.ArrowUtils;
 import com.invest.differential.arrow.RowHasher;
+import com.invest.differential.parallel.ParallelConfig;
 import com.invest.differential.zset.IndexedZSet;
 import com.invest.differential.zset.RowCombiner;
 import com.invest.differential.zset.RowMapper;
@@ -12,6 +13,8 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.*;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.RecursiveTask;
 
 /**
  * Incremental equi-join operator.
@@ -45,6 +48,7 @@ public final class IncrementalJoinOperator implements Operator {
     private ZSet leftState;   // I(Left): accumulated left deltas
     private ZSet rightState;  // I(Right): accumulated right deltas
     private ZSet previousOutput; // previous full join output (used for outer joins)
+    private ParallelConfig parallelConfig = ParallelConfig.disabled();
 
     public IncrementalJoinOperator(Stream leftInput, Stream rightInput,
                                     int[] leftKeyColumns, int[] rightKeyColumns,
@@ -110,11 +114,31 @@ public final class IncrementalJoinOperator implements Operator {
         }
     }
 
+    @Override
+    public void setParallelConfig(ParallelConfig config) {
+        this.parallelConfig = config != null ? config : ParallelConfig.disabled();
+    }
+
     /**
      * Inner join: bilinear incremental formula.
      * ΔResult = (ΔLeft ⋈ I_prev(Right)) + (I_new(Left) ⋈ ΔRight)
+     * When parallel config is enabled and data is large enough, hash-partitions
+     * by join key and runs partitions on separate threads.
      */
     private void stepInner(ZSet deltaLeft, ZSet deltaRight) {
+        int totalRows = deltaLeft.rowCount() + deltaRight.rowCount()
+                + leftState.rowCount() + rightState.rowCount();
+
+        if (parallelConfig.isEnabled()
+                && totalRows >= parallelConfig.getMinRowsForDataParallel()
+                && leftKeyColumns.length > 0) {
+            stepInnerParallel(deltaLeft, deltaRight);
+        } else {
+            stepInnerSequential(deltaLeft, deltaRight);
+        }
+    }
+
+    private void stepInnerSequential(ZSet deltaLeft, ZSet deltaRight) {
         // Part 1: ΔLeft ⋈ I_prev(Right)
         ZSet part1 = innerJoinZSets(deltaLeft, rightState);
 
@@ -138,6 +162,81 @@ public final class IncrementalJoinOperator implements Operator {
         result.compact();
         part1.close();
         part2.close();
+
+        output.setValue(result);
+    }
+
+    private void stepInnerParallel(ZSet deltaLeft, ZSet deltaRight) {
+        int n = Math.min(parallelConfig.getMaxParallelism(),
+                Math.max(2, (deltaLeft.rowCount() + deltaRight.rowCount())
+                        / parallelConfig.getMinRowsForDataParallel()));
+
+        // Hash-partition all four inputs by join key
+        ZSet[] dlParts = deltaLeft.hashPartition(leftKeyColumns, n);
+        ZSet[] drParts = deltaRight.hashPartition(rightKeyColumns, n);
+        ZSet[] lsParts = leftState.hashPartition(leftKeyColumns, n);
+        ZSet[] rsParts = rightState.hashPartition(rightKeyColumns, n);
+
+        // Run N independent join instances in parallel
+        List<ForkJoinTask<ZSet[]>> tasks = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            final int part = i;
+            tasks.add(parallelConfig.getPool().submit(new RecursiveTask<ZSet[]>() {
+                @Override
+                protected ZSet[] compute() {
+                    // Part 1: ΔLeft[p] ⋈ I_Right[p]
+                    ZSet p1 = innerJoinZSets(dlParts[part], rsParts[part]);
+
+                    // Update left state partition
+                    ZSet newLS = lsParts[part].add(dlParts[part]);
+                    newLS.compact();
+                    lsParts[part].close();
+
+                    // Part 2: I_Left_new[p] ⋈ ΔRight[p]
+                    ZSet p2 = innerJoinZSets(newLS, drParts[part]);
+
+                    // Update right state partition
+                    ZSet newRS = rsParts[part].add(drParts[part]);
+                    newRS.compact();
+                    rsParts[part].close();
+
+                    // Result for this partition
+                    ZSet partResult = p1.add(p2);
+                    partResult.compact();
+                    p1.close();
+                    p2.close();
+                    dlParts[part].close();
+                    drParts[part].close();
+
+                    return new ZSet[]{partResult, newLS, newRS};
+                }
+            }));
+        }
+
+        // Collect results and merge state
+        ZSet[] resultParts = new ZSet[n];
+        ZSet[] newLeftParts = new ZSet[n];
+        ZSet[] newRightParts = new ZSet[n];
+        for (int i = 0; i < n; i++) {
+            ZSet[] partResults = tasks.get(i).join();
+            resultParts[i] = partResults[0];
+            newLeftParts[i] = partResults[1];
+            newRightParts[i] = partResults[2];
+        }
+
+        // Merge partitioned results
+        ZSet result = ZSet.concat(resultParts, outputDataSchema, allocator);
+        result.compact();
+        for (ZSet r : resultParts) r.close();
+
+        // Merge partitioned state back
+        leftState.close();
+        leftState = ZSet.concat(newLeftParts, leftInput.dataSchema(), allocator);
+        for (ZSet s : newLeftParts) s.close();
+
+        rightState.close();
+        rightState = ZSet.concat(newRightParts, rightInput.dataSchema(), allocator);
+        for (ZSet s : newRightParts) s.close();
 
         output.setValue(result);
     }
