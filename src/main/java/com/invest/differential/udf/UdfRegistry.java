@@ -181,9 +181,13 @@ public final class UdfRegistry {
                 sb.append("  -\n");
                 sb.append("    name: \"").append(entry.name()).append("\"\n");
                 sb.append("    impls:\n");
-                sb.append("      - args:\n");
-                for (String argType : entry.argTypes()) {
-                    sb.append("          - value: ").append(argType).append("\n");
+                if (entry.argTypes().length == 0) {
+                    sb.append("      - args: []\n");
+                } else {
+                    sb.append("      - args:\n");
+                    for (String argType : entry.argTypes()) {
+                        sb.append("          - value: ").append(argType).append("\n");
+                    }
                 }
                 sb.append("        return: ").append(entry.returnType()).append("\n");
             }
@@ -248,6 +252,9 @@ public final class UdfRegistry {
     }
 
     private static SqlOperandTypeChecker toOperandTypeChecker(String[] argTypes) {
+        if (argTypes.length == 0) {
+            return OperandTypes.NILADIC;
+        }
         SqlTypeFamily[] families = new SqlTypeFamily[argTypes.length];
         for (int i = 0; i < argTypes.length; i++) {
             families[i] = toTypeFamily(argTypes[i]);

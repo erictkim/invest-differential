@@ -27,6 +27,7 @@ Built on:
 - [User-defined functions](#user-defined-functions)
   - [Scalar UDFs](#scalar-udfs)
   - [Aggregate UDAFs](#aggregate-udafs)
+- [Event-time SQL functions](#event-time-sql-functions)
 - [Window functions](#window-functions)
 - [Bitemporal Parquet output](#bitemporal-parquet-output)
 - [Parallel execution and metrics](#parallel-execution-and-metrics)
@@ -291,6 +292,59 @@ engine.registerTable("t", schema)
 The `weight` argument lets a UDAF be **weight-aware** — it sees deletes as
 negative weights, so it can correctly maintain its accumulator
 incrementally.
+
+---
+
+## Event-time SQL functions
+
+A zero-argument built-in function is always available in SQL:
+
+| Function       | Returns                                                          |
+| -------------- | ---------------------------------------------------------------- |
+| `EVENT_TIME()` | The engine's current event time (`BIGINT`) at evaluation time.   |
+
+It reads from the engine's logical clock — the value last passed to
+`pushChanges(table, delta, eventTime)` or `setEventTime(t)`. If no event
+time has ever been set, it falls back to `System.currentTimeMillis()`.
+
+```java
+engine.registerTable("orders", schema)
+      .sql("SELECT order_id, customer FROM orders WHERE EVENT_TIME() >= 1000");
+```
+
+### Capturing per-row creation time
+
+`EVENT_TIME()` returns the *current* clock at the moment the expression
+runs, so calling it from a query over a derived view would give you the
+time of the latest step, not the row's original insert time.
+
+To get the row's creation time, project `EVENT_TIME()` once in a view
+directly over the input table — the resulting timestamp is then a normal
+column that flows through downstream views unchanged:
+
+```java
+engine.registerTable("orders", schema)
+      // Stamp creation time at the input boundary
+      .sql("SELECT *, EVENT_TIME() AS created_at FROM orders", "orders_v")
+      // Reference it downstream like any other column
+      .sql("SELECT customer, created_at FROM orders_v WHERE amount > 100",
+           "big_orders");
+
+engine.pushChanges("orders",
+        ZSet.fromData(schema, allocator, new Object[][]{{1, "alice", 999}}),
+        1000L).step();
+// big_orders snapshot row: ("alice", 1000)
+
+engine.pushChanges("orders",
+        ZSet.fromData(schema, allocator, new Object[][]{{2, "bob", 250}}),
+        2000L).step();
+// big_orders snapshot row: ("alice", 1000), ("bob", 2000)
+```
+
+Why this works: the projection in `orders_v` only fires on rows present
+in the current step's delta, so each row picks up the event time of the
+step that introduced it. That timestamp is then carried as data — no
+re-evaluation, no re-stamping.
 
 ---
 

@@ -51,6 +51,34 @@ public final class IncrementalEngine implements AutoCloseable {
     private IncrementalEngine(BufferAllocator allocator, boolean ownsAllocator) {
         this.allocator = allocator;
         this.ownsAllocator = ownsAllocator;
+        registerBuiltinFunctions();
+    }
+
+    /**
+     * Register engine-aware built-in SQL functions:
+     * <ul>
+     *   <li>{@code EVENT_TIME()} — returns the engine's current event time as a
+     *       {@code BIGINT} (the value last passed to
+     *       {@link #pushChanges(String, ZSet, long)} or {@link #setEventTime(long)},
+     *       or {@link System#currentTimeMillis()} if none was set).</li>
+     * </ul>
+     *
+     * <p><b>Capturing per-row creation time:</b> {@code EVENT_TIME()} returns
+     * the current clock at the moment the expression is evaluated. To capture
+     * the time a row was originally inserted, project it in a SELECT directly
+     * over the input table and reference the column downstream:
+     *
+     * <pre>{@code
+     * engine.sql("SELECT *, EVENT_TIME() AS created_at FROM orders", "orders_v");
+     * engine.sql("SELECT customer, created_at FROM orders_v WHERE amount > 100");
+     * }</pre>
+     *
+     * The {@code created_at} column is stamped once at insert time and flows
+     * through subsequent views as a plain value.
+     */
+    private void registerBuiltinFunctions() {
+        ScalarUdf clock = args -> currentClock();
+        udfRegistry.register("event_time", clock, new String[0], "i64");
     }
 
     /**
