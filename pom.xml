@@ -61,6 +61,13 @@
             <version>1.37.0</version>
         </dependency>
 
+        <!-- Parquet I/O (Hadoop-free) -->
+        <dependency>
+            <groupId>blue.strategic.parquet</groupId>
+            <artifactId>parquet-floor</artifactId>
+            <version>1.51</version>
+        </dependency>
+
         <!-- Testing -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>

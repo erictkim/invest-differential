@@ -328,6 +328,63 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Stream the deltas of a registered view to a Parquet file with bitemporal
+     * {@code start_time} and {@code end_time} columns. Each row that has been
+     * inserted but not yet retracted is flushed to the file when the engine
+     * closes.
+     *
+     * <p>Must be called after the view's query has been compiled via
+     * {@link #sql(String, String)}.
+     */
+    public IncrementalEngine writeViewToParquet(String viewName, java.io.File outFile) {
+        ensureCompiled();
+        String key = viewName.toLowerCase(java.util.Locale.ROOT);
+        com.invest.differential.operator.Stream stream = viewStreams.get(key);
+        Schema schema = viewSchemas.get(key);
+        if (stream == null || schema == null) {
+            throw new IllegalArgumentException("Unknown view: " + viewName);
+        }
+        return attachParquetSink(viewName, stream, schema, outFile);
+    }
+
+    /**
+     * Stream the deltas of a registered input table to a Parquet file with
+     * bitemporal {@code start_time} and {@code end_time} columns. Live rows
+     * are flushed to the file when the engine closes.
+     *
+     * <p>Must be called after at least one query has been compiled (so the
+     * input operator exists in the circuit).
+     */
+    public IncrementalEngine writeTableToParquet(String tableName, java.io.File outFile) {
+        ensureCompiled();
+        InputOperator input = circuit.getInput(tableName);
+        if (input == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        Schema schema = tableSchemas.get(tableName);
+        if (schema == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        return attachParquetSink(tableName, input.getOutput(), schema, outFile);
+    }
+
+    private IncrementalEngine attachParquetSink(String name,
+                                                com.invest.differential.operator.Stream stream,
+                                                Schema schema,
+                                                java.io.File outFile) {
+        try {
+            com.invest.differential.io.ParquetSerializer serializer =
+                    com.invest.differential.io.ParquetSerializer.create(schema, outFile);
+            com.invest.differential.io.ParquetSinkOperator sink =
+                    new com.invest.differential.io.ParquetSinkOperator(name, stream, serializer);
+            circuit.addOperator(sink);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("Failed to open Parquet writer for " + outFile, e);
+        }
+        return this;
+    }
+
+    /**
      * Reset all operator state.
      */
     public IncrementalEngine reset() {
