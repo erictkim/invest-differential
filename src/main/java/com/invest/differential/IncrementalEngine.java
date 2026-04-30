@@ -46,6 +46,7 @@ public final class IncrementalEngine implements AutoCloseable {
     private Circuit circuit;
     private boolean compiled;
     private ParallelConfig parallelConfig = ParallelConfig.disabled();
+    private Long currentEventTime; // most recent event time pushed via pushChanges(name, delta, eventTime)
 
     private IncrementalEngine(BufferAllocator allocator, boolean ownsAllocator) {
         this.allocator = allocator;
@@ -245,6 +246,41 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Push a delta with an explicit event time. The event time becomes the
+     * current logical timestamp used by Parquet sinks (see
+     * {@link #writeViewToParquet(String, java.io.File)}) for {@code start_time}
+     * and {@code end_time} stamping until the next call that supplies an event
+     * time. If no event time has ever been supplied, sinks fall back to
+     * {@link System#currentTimeMillis()}.
+     */
+    public IncrementalEngine pushChanges(String tableName, ZSet delta, long eventTime) {
+        this.currentEventTime = eventTime;
+        return pushChanges(tableName, delta);
+    }
+
+    /**
+     * Set the current event time used by Parquet sinks for the next steps.
+     * Useful when no input changes are being pushed but a logical time advance
+     * is required (e.g., to stamp {@code end_time} when the engine closes).
+     */
+    public IncrementalEngine setEventTime(long eventTime) {
+        this.currentEventTime = eventTime;
+        return this;
+    }
+
+    /**
+     * Get the most recently set event time, or {@code null} if none has been set.
+     */
+    public Long getEventTime() {
+        return currentEventTime;
+    }
+
+    private long currentClock() {
+        Long t = currentEventTime;
+        return t != null ? t : System.currentTimeMillis();
+    }
+
+    /**
      * Execute one step of the incremental circuit.
      * Processes all pending deltas through the operator graph.
      */
@@ -374,7 +410,7 @@ public final class IncrementalEngine implements AutoCloseable {
                                                 java.io.File outFile) {
         try {
             com.invest.differential.io.ParquetSerializer serializer =
-                    com.invest.differential.io.ParquetSerializer.create(schema, outFile);
+                    com.invest.differential.io.ParquetSerializer.create(schema, outFile, this::currentClock);
             com.invest.differential.io.ParquetSinkOperator sink =
                     new com.invest.differential.io.ParquetSinkOperator(name, stream, serializer);
             circuit.addOperator(sink);

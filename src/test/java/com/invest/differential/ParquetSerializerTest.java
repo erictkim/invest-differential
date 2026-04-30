@@ -167,6 +167,58 @@ class ParquetSerializerTest {
         }
     }
 
+    @Test
+    void usesEventTimeFromPushChanges(@TempDir Path tmp) throws Exception {
+        Schema schema = new Schema(List.of(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.notNullable("name", new ArrowType.Utf8())
+        ));
+        File outFile = tmp.resolve("event_time_view.parquet").toFile();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("users", schema)
+                  .sql("SELECT id, name FROM users", "all_users")
+                  .writeViewToParquet("all_users", outFile);
+
+            // Insert alice at event_time=100
+            engine.pushChanges("users",
+                    ZSet.fromData(schema, allocator, new Object[][]{{1, "alice"}}),
+                    100L).step();
+
+            // Insert bob at event_time=200
+            engine.pushChanges("users",
+                    ZSet.fromData(schema, allocator, new Object[][]{{2, "bob"}}),
+                    200L).step();
+
+            // Delete alice at event_time=300
+            ZSet del;
+            try (ZSet src = ZSet.fromData(schema, allocator, new Object[][]{{1, "alice"}})) {
+                del = src.negate();
+            }
+            engine.pushChanges("users", del, 300L).step();
+
+            // Advance event-time clock to 400 so the close() flush stamps that time
+            engine.setEventTime(400L);
+        }
+
+        try (Stream<Map<String, Object>> s = ParquetReader.streamContent(outFile, mapHydrator())) {
+            List<Map<String, Object>> rows = s.toList();
+            assertEquals(2, rows.size());
+            Map<String, Map<String, Object>> byName = new HashMap<>();
+            for (Map<String, Object> r : rows) byName.put((String) r.get("NAME"), r);
+
+            Map<String, Object> alice = byName.get("alice");
+            assertNotNull(alice);
+            assertEquals(100L, alice.get("start_time"));
+            assertEquals(300L, alice.get("end_time"));
+
+            Map<String, Object> bob = byName.get("bob");
+            assertNotNull(bob);
+            assertEquals(200L, bob.get("start_time"));
+            assertEquals(400L, bob.get("end_time"));
+        }
+    }
+
     private static HydratorSupplier<Map<String, Object>, Map<String, Object>> mapHydrator() {
         return columns -> new Hydrator<Map<String, Object>, Map<String, Object>>() {
             @Override
