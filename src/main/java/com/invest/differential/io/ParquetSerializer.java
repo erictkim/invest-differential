@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
-import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -287,47 +286,4 @@ public final class ParquetSerializer implements AutoCloseable {
         throw new UnsupportedOperationException("Unsupported type: " + type);
     }
 
-    /** Hashable wrapper around a row's data values (handles {@code byte[]}). */
-    private static final class RowKey {
-        private final Object[] values;
-        private final int hash;
-
-        RowKey(Object[] values) {
-            this.values = values;
-            int h = 1;
-            for (Object v : values) {
-                h = 31 * h + valueHash(v);
-            }
-            this.hash = h;
-        }
-
-        @Override
-        public int hashCode() { return hash; }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (this == obj) return true;
-            if (!(obj instanceof RowKey other)) return false;
-            if (other.hash != hash || other.values.length != values.length) return false;
-            for (int i = 0; i < values.length; i++) {
-                if (!valueEquals(values[i], other.values[i])) return false;
-            }
-            return true;
-        }
-
-        private static int valueHash(Object v) {
-            if (v == null) return 0;
-            if (v instanceof byte[] b) return Arrays.hashCode(b);
-            return v.hashCode();
-        }
-
-        private static boolean valueEquals(Object a, Object b) {
-            if (a == b) return true;
-            if (a == null || b == null) return false;
-            if (a instanceof byte[] ab && b instanceof byte[] bb) {
-                return Arrays.equals(ab, bb);
-            }
-            return a.equals(b);
-        }
-    }
 }

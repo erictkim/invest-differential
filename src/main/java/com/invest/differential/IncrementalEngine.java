@@ -449,6 +449,57 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Attach an in-memory bitemporal accumulator sink to a registered view.
+     * The returned {@link com.invest.differential.io.AccumulatorSinkOperator}
+     * collects one {@link com.invest.differential.io.BitemporalAccumulator}
+     * record per row that is created and either later retracted or still live
+     * when the engine closes. The sink's
+     * {@link com.invest.differential.io.AccumulatorSinkOperator#schema()}
+     * exposes the Arrow schema (column names + types) for each row's values.
+     *
+     * <p>Must be called after the view's query has been compiled via
+     * {@link #sql(String, String)}.
+     */
+    public com.invest.differential.io.AccumulatorSinkOperator accumulateView(String viewName) {
+        ensureCompiled();
+        String key = viewName.toLowerCase(java.util.Locale.ROOT);
+        com.invest.differential.operator.Stream stream = viewStreams.get(key);
+        Schema schema = viewSchemas.get(key);
+        if (stream == null || schema == null) {
+            throw new IllegalArgumentException("Unknown view: " + viewName);
+        }
+        return attachAccumulatorSink(viewName, stream, schema);
+    }
+
+    /**
+     * Attach an in-memory bitemporal accumulator sink to a registered input
+     * table. See {@link #accumulateView(String)} for semantics.
+     */
+    public com.invest.differential.io.AccumulatorSinkOperator accumulateTable(String tableName) {
+        ensureCompiled();
+        InputOperator input = circuit.getInput(tableName);
+        if (input == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        Schema schema = tableSchemas.get(tableName);
+        if (schema == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        return attachAccumulatorSink(tableName, input.getOutput(), schema);
+    }
+
+    private com.invest.differential.io.AccumulatorSinkOperator attachAccumulatorSink(
+            String name,
+            com.invest.differential.operator.Stream stream,
+            Schema schema) {
+        com.invest.differential.io.AccumulatorSinkOperator sink =
+                new com.invest.differential.io.AccumulatorSinkOperator(
+                        name, stream, schema, this::currentClock);
+        circuit.addOperator(sink);
+        return sink;
+    }
+
+    /**
      * Reset all operator state.
      */
     public IncrementalEngine reset() {
