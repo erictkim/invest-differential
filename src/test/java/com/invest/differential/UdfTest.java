@@ -1,5 +1,6 @@
 package com.invest.differential;
 
+import com.invest.differential.udf.TableUdf;
 import com.invest.differential.udf.UdfRegistry;
 import com.invest.differential.zset.ZSet;
 import org.apache.arrow.memory.BufferAllocator;
@@ -280,6 +281,168 @@ class UdfTest {
         assertNotNull(registry.get("my_func"));
         assertNotNull(registry.get("MY_FUNC")); // case-insensitive
         assertNull(registry.get("nonexistent"));
+    }
+
+    // ---- Table UDF (multi-row, multi-column) ----
+
+    /** CSV-splitter UDTF: (id, csv) -> rows of (id, part, idx). */
+    static final TableUdf CSV_SPLIT = args -> {
+        Integer id = (Integer) args[0];
+        String s = (String) args[1];
+        if (s == null) return List.of();
+        List<Object[]> out = new ArrayList<>();
+        String[] parts = s.split(",");
+        for (int i = 0; i < parts.length; i++) {
+            out.add(new Object[]{id, parts[i], i});
+        }
+        return out;
+    };
+
+    private static Schema csvSourceSchema() {
+        return new Schema(List.of(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("csv", FieldType.nullable(new ArrowType.Utf8()), null)
+        ));
+    }
+
+    private static Schema csvOutputSchema() {
+        return new Schema(List.of(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("part", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("idx", FieldType.nullable(new ArrowType.Int(32, true)), null)
+        ));
+    }
+
+    @Test
+    void tableUdf_explodesString() {
+        Schema in = csvSourceSchema();
+        Schema out = csvOutputSchema();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("t", in)
+                    .applyTableUdf("exploded", "t", new int[]{0, 1}, CSV_SPLIT, out);
+
+            ZSet delta = ZSet.fromData(in, allocator, new Object[][]{
+                    {1, "a,b,c"},
+                    {2, "x,y"}
+            });
+            engine.pushChanges("t", delta).step();
+
+            ZSet result = engine.getOutput("exploded");
+            result.compact();
+            assertEquals(5, result.rowCount()); // 3 + 2
+
+            Map<List<Object>, Integer> rows = toMap(result);
+            assertTrue(rows.containsKey(List.of(1, "a", 0)));
+            assertTrue(rows.containsKey(List.of(1, "b", 1)));
+            assertTrue(rows.containsKey(List.of(1, "c", 2)));
+            assertTrue(rows.containsKey(List.of(2, "x", 0)));
+            assertTrue(rows.containsKey(List.of(2, "y", 1)));
+        }
+    }
+
+    @Test
+    void tableUdf_incrementalRetraction() {
+        Schema in = csvSourceSchema();
+        Schema out = csvOutputSchema();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("t", in)
+                    .applyTableUdf("exploded", "t", new int[]{0, 1}, CSV_SPLIT, out);
+
+            // Step 1: insert one source row that explodes to 3.
+            ZSet delta1 = ZSet.fromData(in, allocator, new Object[][]{{1, "a,b,c"}});
+            engine.pushChanges("t", delta1).step();
+            assertEquals(3, engine.getOutput("exploded").rowCount());
+
+            // Step 2: insert a second source row that explodes to 2.
+            ZSet delta2 = ZSet.fromData(in, allocator, new Object[][]{{2, "x,y"}});
+            engine.pushChanges("t", delta2).step();
+            ZSet step2 = engine.getOutput("exploded");
+            step2.compact();
+            assertEquals(2, step2.rowCount());
+
+            // Snapshot should accumulate to 5 live rows.
+            ZSet snap = engine.getSnapshot("exploded");
+            try {
+                snap.compact();
+                assertEquals(5, snap.rowCount());
+            } finally {
+                snap.close();
+            }
+
+            // Step 3: retract the first source row.
+            ZSet neg;
+            try (ZSet src = ZSet.fromData(in, allocator, new Object[][]{{1, "a,b,c"}})) {
+                neg = src.negate();
+            }
+            engine.pushChanges("t", neg).step();
+            ZSet step3 = engine.getOutput("exploded");
+            step3.compact();
+            assertEquals(3, step3.rowCount()); // 3 retraction rows
+            for (int i = 0; i < step3.rowCount(); i++) {
+                assertEquals(-1, step3.getWeight(i));
+            }
+
+            ZSet snap2 = engine.getSnapshot("exploded");
+            try {
+                snap2.compact();
+                assertEquals(2, snap2.rowCount()); // only id=2 rows remain
+            } finally {
+                snap2.close();
+            }
+        }
+    }
+
+    @Test
+    void tableUdf_chainedWithSql() {
+        Schema in = csvSourceSchema();
+        Schema out = csvOutputSchema();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("t", in)
+                    .applyTableUdf("exploded", "t", new int[]{0, 1}, CSV_SPLIT, out)
+                    .sql("SELECT id, part FROM exploded WHERE idx > 0", "filtered");
+
+            ZSet delta = ZSet.fromData(in, allocator, new Object[][]{
+                    {1, "a,b,c"},
+                    {2, "x,y"}
+            });
+            engine.pushChanges("t", delta).step();
+
+            ZSet result = engine.getOutput("filtered");
+            result.compact();
+            // From (1, a,b,c) keep b(idx=1), c(idx=2); from (2, x,y) keep y(idx=1).
+            assertEquals(3, result.rowCount());
+            Map<List<Object>, Integer> rows = toMap(result);
+            assertTrue(rows.containsKey(List.of(1, "b")));
+            assertTrue(rows.containsKey(List.of(1, "c")));
+            assertTrue(rows.containsKey(List.of(2, "y")));
+        }
+    }
+
+    @Test
+    void tableUdf_emptyOutputIsAllowed() {
+        Schema in = csvSourceSchema();
+        Schema out = csvOutputSchema();
+
+        try (IncrementalEngine engine = IncrementalEngine.create(allocator)) {
+            engine.registerTable("t", in)
+                    .applyTableUdf("exploded", "t", new int[]{0, 1}, CSV_SPLIT, out);
+
+            // Null csv → UDF returns empty list → input row produces no output rows.
+            ZSet delta = ZSet.fromData(in, allocator, new Object[][]{
+                    {1, null},
+                    {2, "x"}
+            });
+            engine.pushChanges("t", delta).step();
+
+            ZSet result = engine.getOutput("exploded");
+            result.compact();
+            assertEquals(1, result.rowCount());
+            Map<List<Object>, Integer> rows = toMap(result);
+            assertTrue(rows.containsKey(List.of(2, "x", 0)));
+        }
     }
 
     // ---- Helpers ----

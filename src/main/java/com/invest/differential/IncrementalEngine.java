@@ -146,6 +146,99 @@ public final class IncrementalEngine implements AutoCloseable {
     }
 
     /**
+     * Apply a table-valued UDF (UDTF) to a registered table or previously
+     * compiled view, producing a new named view. The UDF is invoked once per
+     * source row and may emit zero or more output rows; the source row's
+     * weight is propagated to each emitted row, so retractions cancel
+     * correctly.
+     *
+     * <p>The resulting view is reachable via {@link #getOutput(String)} /
+     * {@link #getSnapshot(String)} and is referenceable by name from
+     * subsequent {@link #sql(String, String)} calls.
+     *
+     * @param viewName             name to assign to the resulting view
+     * @param sourceName           name of an already-registered input table or
+     *                             previously compiled named view
+     * @param argColumnIndices     indices into the source row to pass as
+     *                             arguments to the UDF
+     * @param impl                 the table-valued UDF
+     * @param outputSchema         schema of rows emitted by the UDF
+     */
+    public IncrementalEngine applyTableUdf(String viewName,
+                                           String sourceName,
+                                           int[] argColumnIndices,
+                                           com.invest.differential.udf.TableUdf impl,
+                                           Schema outputSchema) {
+        if (viewName == null || viewName.isEmpty()) {
+            throw new IllegalArgumentException("viewName must be non-empty");
+        }
+        if (circuit == null) {
+            circuit = new Circuit();
+            circuit.setParallelConfig(parallelConfig);
+        }
+
+        // Resolve source: previously compiled view, then registered table.
+        String sourceKey = sourceName.toLowerCase(java.util.Locale.ROOT);
+        Stream sourceStream = viewStreams.get(sourceKey);
+        Schema sourceSchema = viewSchemas.get(sourceKey);
+        if (sourceStream == null) {
+            Schema tableSchema = tableSchemas.get(sourceName);
+            if (tableSchema == null) {
+                // Fall back to case-insensitive lookup over registered tables.
+                for (Map.Entry<String, Schema> e : tableSchemas.entrySet()) {
+                    if (e.getKey().equalsIgnoreCase(sourceName)) {
+                        tableSchema = e.getValue();
+                        break;
+                    }
+                }
+            }
+            if (tableSchema == null) {
+                throw new IllegalArgumentException(
+                        "Unknown source table or view: " + sourceName);
+            }
+            InputOperator existing = circuit.findInput(sourceName);
+            if (existing == null) {
+                existing = new InputOperator(sourceName, tableSchema, allocator);
+                circuit.addOperator(existing);
+            }
+            sourceStream = existing.getOutput();
+            sourceSchema = tableSchema;
+        }
+
+        // Validate argument column indices.
+        int sourceColCount = sourceSchema.getFields().size();
+        for (int idx : argColumnIndices) {
+            if (idx < 0 || idx >= sourceColCount) {
+                throw new IllegalArgumentException(
+                        "argColumnIndex " + idx + " out of range for source '"
+                                + sourceName + "' (cols=" + sourceColCount + ")");
+            }
+        }
+
+        String viewKey = viewName.toLowerCase(java.util.Locale.ROOT);
+        if (outputNames.containsKey(viewKey) || viewStreams.containsKey(viewKey)) {
+            throw new IllegalArgumentException("View name already in use: " + viewName);
+        }
+
+        com.invest.differential.operator.TableUdfOperator udtf =
+                new com.invest.differential.operator.TableUdfOperator(
+                        sourceStream, outputSchema, impl, argColumnIndices);
+        circuit.addOperator(udtf);
+
+        OutputOperator out = new OutputOperator(viewName, udtf.getOutput(), allocator);
+        int outputIndex = circuit.getOutputs().size();
+        circuit.addOperator(out);
+
+        outputNames.put(viewKey, outputIndex);
+        viewStreams.put(viewKey, udtf.getOutput());
+        viewSchemas.put(viewKey, outputSchema);
+
+        this.compiled = true;
+        circuit.setParallelConfig(parallelConfig);
+        return this;
+    }
+
+    /**
      * Compile a SQL query into the incremental circuit.
      * Can be called multiple times to add multiple views over the same input tables.
      * Each call adds one output, accessible via {@link #getOutput(int)} using the
