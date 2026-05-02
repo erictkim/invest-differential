@@ -141,8 +141,15 @@ public final class ArrowUtils {
     }
 
     public static VectorSchemaRoot cloneRoot(VectorSchemaRoot src, BufferAllocator allocator) {
-        Schema schema = src.getSchema();
-        VectorSchemaRoot dst = VectorSchemaRoot.create(schema, allocator);
+        return cloneRoot(src, src.getSchema(), allocator);
+    }
+
+    /**
+     * Clone {@code src} into a new {@link VectorSchemaRoot} that uses {@code targetSchema}.
+     * Field types must match positionally; only field names may differ.
+     */
+    public static VectorSchemaRoot cloneRoot(VectorSchemaRoot src, Schema targetSchema, BufferAllocator allocator) {
+        VectorSchemaRoot dst = VectorSchemaRoot.create(targetSchema, allocator);
         dst.allocateNew();
         int rowCount = src.getRowCount();
         for (int row = 0; row < rowCount; row++) {

@@ -308,32 +308,66 @@ public final class IncrementalEngine implements AutoCloseable {
         // Register view names and streams for newly added outputs
         int outputsAfter = circuit.getOutputs().size();
         List<Stream> resultStreams = compiler.getLastResultStreams();
+        List<Plan.Root> roots = plan.getRoots();
         if (viewName != null) {
             String key = viewName.toLowerCase(java.util.Locale.ROOT);
             outputNames.put(key, outputsBefore);
             if (!resultStreams.isEmpty()) {
                 viewStreams.put(key, resultStreams.get(0));
-                // Build view schema with correct column names from the Substrait plan root
-                Plan.Root root = plan.getRoots().get(0);
-                List<String> names = root.getNames();
-                Schema streamSchema = resultStreams.get(0).dataSchema();
-                List<org.apache.arrow.vector.types.pojo.Field> viewFields = new ArrayList<>();
-                for (int i = 0; i < names.size() && i < streamSchema.getFields().size(); i++) {
-                    org.apache.arrow.vector.types.pojo.Field original = streamSchema.getFields().get(i);
-                    viewFields.add(new org.apache.arrow.vector.types.pojo.Field(
-                            names.get(i), original.getFieldType(), original.getChildren()));
-                }
-                viewSchemas.put(key, new Schema(viewFields));
+                viewSchemas.put(key, renameSchema(resultStreams.get(0).dataSchema(),
+                        roots.isEmpty() ? null : roots.get(0).getNames()));
             }
         }
-        // Auto-generate names for unnamed views
+        // Auto-generate names for unnamed views and record their schemas
         for (int i = outputsBefore; i < outputsAfter; i++) {
             String autoName = "view_" + i;
             if (!outputNames.containsValue(i)) {
                 outputNames.putIfAbsent(autoName, i);
             }
+            // Resolve the canonical key for this output index and ensure schema is recorded
+            String key = nameForOutputIndex(i);
+            if (key != null && !viewSchemas.containsKey(key)) {
+                int rel = i - outputsBefore;
+                if (rel < resultStreams.size()) {
+                    List<String> names = (rel < roots.size()) ? roots.get(rel).getNames() : null;
+                    viewSchemas.put(key, renameSchema(resultStreams.get(rel).dataSchema(), names));
+                }
+            }
         }
         return this;
+    }
+
+    private String nameForOutputIndex(int index) {
+        for (Map.Entry<String, Integer> e : outputNames.entrySet()) {
+            if (e.getValue() != null && e.getValue() == index) {
+                return e.getKey();
+            }
+        }
+        return null;
+    }
+
+    private Schema resolveOutputSchema(int index, Schema fallback) {
+        String key = nameForOutputIndex(index);
+        if (key != null) {
+            Schema s = viewSchemas.get(key);
+            if (s != null) return s;
+        }
+        return fallback;
+    }
+
+    private static Schema renameSchema(Schema streamSchema, List<String> names) {
+        if (names == null || names.isEmpty()) {
+            return streamSchema;
+        }
+        List<org.apache.arrow.vector.types.pojo.Field> viewFields = new ArrayList<>();
+        List<org.apache.arrow.vector.types.pojo.Field> orig = streamSchema.getFields();
+        for (int i = 0; i < orig.size(); i++) {
+            org.apache.arrow.vector.types.pojo.Field f = orig.get(i);
+            String newName = (i < names.size()) ? names.get(i) : f.getName();
+            viewFields.add(new org.apache.arrow.vector.types.pojo.Field(
+                    newName, f.getFieldType(), f.getChildren()));
+        }
+        return new Schema(viewFields);
     }
 
     /**
@@ -428,11 +462,13 @@ public final class IncrementalEngine implements AutoCloseable {
             throw new IndexOutOfBoundsException("Output index " + index + " out of range (size=" + outputs.size() + ")");
         }
         ZSet val = outputs.get(index).getValue();
+        Schema dataSchema = resolveOutputSchema(index, outputs.get(index).getOutput().dataSchema());
         if (val == null) {
-            return ZSet.empty(outputs.get(index).getOutput().dataSchema(), allocator);
+            return ZSet.empty(dataSchema, allocator);
         }
-        return ZSet.fromRoot(val.dataSchema(),
-                ArrowUtils.cloneRoot(val.data(), allocator), allocator);
+        Schema fullTarget = ArrowUtils.createSchemaWithWeight(dataSchema);
+        return ZSet.fromRoot(dataSchema,
+                ArrowUtils.cloneRoot(val.data(), fullTarget, allocator), allocator);
     }
 
     /**
@@ -464,8 +500,10 @@ public final class IncrementalEngine implements AutoCloseable {
             throw new IndexOutOfBoundsException("Output index " + index + " out of range (size=" + outputs.size() + ")");
         }
         ZSet snapshot = outputs.get(index).getSnapshot();
-        return ZSet.fromRoot(snapshot.dataSchema(),
-                ArrowUtils.cloneRoot(snapshot.data(), allocator), allocator);
+        Schema dataSchema = resolveOutputSchema(index, snapshot.dataSchema());
+        Schema fullTarget = ArrowUtils.createSchemaWithWeight(dataSchema);
+        return ZSet.fromRoot(dataSchema,
+                ArrowUtils.cloneRoot(snapshot.data(), fullTarget, allocator), allocator);
     }
 
     /**
