@@ -1,0 +1,21 @@
+invest-differential
+Copyright 2026 Eric Kim
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties:
+
+  Apache Substrait Java (Isthmus)
+  Copyright The Substrait Authors
+  Licensed under the Apache License, Version 2.0
+  https://github.com/substrait-io/substrait-java
+
+  The class src/main/java/io/substrait/isthmus/UdfSqlToSubstrait.java is an
+  original work of this project, but is deliberately placed in the
+  io.substrait.isthmus package so that it can extend the package-private
+  SqlConverterBase class from Isthmus. It is not distributed by, or endorsed
+  by, the Substrait project.
+
+  Apache Arrow      -- Copyright The Apache Software Foundation, Apache-2.0
+  Apache Calcite    -- Copyright The Apache Software Foundation, Apache-2.0
+  parquet-floor     -- Copyright Blue Strategic Ltd, Apache-2.0

@@ -529,3 +529,10 @@ for end-to-end examples of every feature above:
 - [WindowFunctionTest.java](src/test/java/com/invest/differential/WindowFunctionTest.java) / [RollingAggregateTest.java](src/test/java/com/invest/differential/RollingAggregateTest.java)
 - [ParquetSerializerTest.java](src/test/java/com/invest/differential/ParquetSerializerTest.java) — bitemporal sink
 - [ParallelExecutionTest.java](src/test/java/com/invest/differential/ParallelExecutionTest.java)
+
+---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Third-party
+attributions are listed in [NOTICE](NOTICE).

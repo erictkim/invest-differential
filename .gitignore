@@ -45,3 +45,6 @@ buildNumber.properties
 .project
 .settings/
 .factorypath
+
+# GitHub Copilot app-modernization artifacts
+.github/java-upgrade/hooks/*.json
